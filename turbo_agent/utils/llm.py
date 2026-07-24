@@ -11,6 +11,13 @@ import litellm
 # Suppress litellm's verbose logging
 litellm.suppress_debug_info = True
 
+# Disable litellm's Anthropic/Gemini context-caching transform. Otherwise litellm
+# creates explicit Google CachedContent resources and then references them in the
+# same generateContent call that still carries system_instruction/tools, which the
+# Gemini API rejects: "CachedContent can not be used with GenerateContent request
+# setting system_instruction, tools or tool_config."
+litellm.disable_anthropic_gemini_context_caching_transform = True
+
 
 def _build_kwargs(
     model: str,

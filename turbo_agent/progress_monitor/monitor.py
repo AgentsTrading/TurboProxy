@@ -42,7 +42,7 @@ class ProgressMonitorResult:
 class ProgressMonitor:
     def __init__(self, cfg: ProgressMonitorConfig):
         self.cfg = cfg
-        self.model_id = verifier_model_id(cfg.model)
+        self.model_id = verifier_model_id(cfg.model, purpose="progress")
         self._client = None
         self._client_built = False
         _logger.info(
@@ -52,12 +52,11 @@ class ProgressMonitor:
 
     @property
     def client(self):
-        """The llm-verifier client for the configured model — Gemini,
-        DeepSeek, or any OpenAI-compatible logprob server, chosen by the
-        model-name prefix. None lets llm-verifier create one from the
-        environment."""
+        """The client for the configured, validated progress provider."""
         if not self._client_built:
-            self._client = build_verifier_client(self.cfg.model)
+            self._client = build_verifier_client(
+                self.cfg.model, purpose="progress"
+            )
             self._client_built = True
         return self._client
 

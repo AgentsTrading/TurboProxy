@@ -44,7 +44,7 @@ cp .env.example .env
 ```bash
 # .env
 VERTEX_API_KEY=your-vertex-key     # preferred for Gemini 2.5 logprobs (verifier)
-# GEMINI_API_KEY=your-gemini-key     # used by gemini/ models (AI Studio)
+GEMINI_API_KEY=your-gemini-key     # used by gemini/ backend models (AI Studio)
 # OPENAI_API_KEY=...               # only if you route to openai/ models
 # ANTHROPIC_API_KEY=...            # only if you route to anthropic/ models
 ```
@@ -55,13 +55,21 @@ and progress monitor use Gemini **logprobs**, which are best served by a Vertex
 AI key (`VERTEX_API_KEY` + `provider: vertex_ai` in the config); a plain
 `GEMINI_API_KEY` also works for the `gemini/` backend models.
 
+The reference config intentionally uses the Gemini API for candidate generation
+and Vertex AI for verifier/progress logprobs. LiteLLM's `vertex_ai` backend uses
+Google ADC/project authentication; a Vertex Express API key alone is not a
+replacement for ADC on that backend path.
+
 Verify your keys are valid:
 
 ```bash
 turbo-agent check
 ```
 
-It checks every supported provider (Gemini, Vertex AI, DeepSeek, OpenAI, Anthropic) and reports each with ✅ / ❌ / ⚠️ / ⚪️, flagging which keys your config actually uses. The Vertex and DeepSeek checks also confirm the backend returns token logprobs, which the verifier needs.
+It checks every supported provider (Gemini, Vertex AI, DeepSeek, OpenAI,
+Anthropic) and reports each with ✅ / ❌ / ⚠️ / ⚪️, flagging which keys your
+config actually uses. Vertex and DeepSeek checks for verifier/progress models
+also confirm the backend returns the token logprobs those scoring paths need.
 
 ## Run
 
@@ -94,7 +102,7 @@ over the verifier's score-token distribution, and the Anthropic Messages API
 returns no token logprobs — there is nothing to take an expectation over.
 Configuring `anthropic/` under `verifier.model` raises an error rather than
 failing somewhere downstream. Generate with Claude, verify with a logprob
-backend (`deepseek/`, `openai/`, or `gemini/` on Vertex).
+backend (`deepseek/`, `gemini/` on Vertex, or a vLLM/SGLang endpoint).
 
 ### Use with opencode
 
@@ -146,22 +154,74 @@ export OPENAI_API_BASE=http://localhost:8888/v1
 
 ## Configuration
 
-Edit `turbo-agent.yaml`. API keys can reference environment variables with `$VAR_NAME` syntax. See the reference `turbo-agent.yaml` file for reference and usage.
+Edit `turbo-agent.yaml`. API keys and `base_url` values can reference environment
+variables with `$VAR_NAME` syntax. See the reference `turbo-agent.yaml` file for
+reference and usage.
 
 ### Model prefixes
 
 | Prefix | Provider |
 |--------|----------|
 | `gemini/` | Google Gemini |
+| `vertex_ai/` | Google Vertex AI |
 | `deepseek/` | DeepSeek |
 | `openai/` | OpenAI |
 | `anthropic/` | Anthropic |
-| (none) | OpenAI-compatible endpoint |
+| (none) + `base_url` | OpenAI-compatible endpoint |
 
-The same prefixes select the **verifier** backend, except `anthropic/`. The verifier scores with
-token logprobs, so it needs a backend that returns them: Gemini through Vertex
-AI (`provider: vertex_ai`), DeepSeek through its hosted API, or any
-OpenAI-compatible logprob server (vLLM, SGLang) via `base_url`.
+`provider` can replace the prefix and takes precedence when both are present.
+For example, `name: gemini-2.5-flash` with `provider: gemini` is equivalent to
+the `gemini/` backend prefix. A bare model name with `base_url` and no provider
+defaults to `provider: openai`. Without either setting, LiteLLM provider
+detection is accepted only for the five providers listed above. Any other
+LiteLLM provider requires explicit model-level `provider` and `base_url` values
+so process-wide endpoint overrides cannot redirect that model's credentials.
+
+Each backend model can use its own custom endpoint. Organization-style model
+IDs such as `Qwen/Qwen3.5-9B` remain intact:
+
+```yaml
+backend:
+  models:
+    - name: Qwen/Qwen3.5-9B
+      base_url: http://localhost:8000/v1
+      api_key: $OPENAI_API_KEY
+```
+
+For non-Vertex providers, a custom `base_url` requires an explicit, non-empty
+`api_key` so credentials from another provider or model can never be used as an
+implicit fallback. Vertex backend/context routes are the exception: LiteLLM
+uses ADC/project authentication and rejects API keys on that path. Vertex
+verifier/progress routes use google-genai and may use `VERTEX_API_KEY` or ADC.
+To use ADC for the reference verifier and progress monitor, remove their two
+`api_key: $VERTEX_API_KEY` lines and unset `VERTEX_API_KEY`. When no model-level
+key is configured, verifier/progress clients still use a non-empty
+`VERTEX_API_KEY` from the environment before falling back to ADC. An explicit
+environment reference is treated as required and fails configuration when the
+variable is unset or empty.
+
+Backend routes ignore process-wide provider endpoint overrides such as
+`OPENAI_BASE_URL`, `OPENAI_API_BASE`, `DEEPSEEK_API_BASE`, `GEMINI_API_BASE`,
+and `ANTHROPIC_BASE_URL`; set `base_url` on the individual model instead. This
+keeps ambient or client-side variables from silently redirecting outgoing
+backend credentials. Verifier/progress OpenAI routes retain llm-verifier's
+documented `OPENAI_BASE_URL` fallback.
+
+The verifier scores with token logprobs, so it needs a backend that returns
+them: Gemini through Vertex AI (`provider: vertex_ai`), DeepSeek through its
+hosted API, or an OpenAI-compatible logprob server (vLLM, SGLang) via
+`base_url`. The official OpenAI API lacks the score-prefill extensions used by
+`llm-verifier 0.2.0` for tournament comparisons. The plain Gemini API is also
+not sufficient; a Gemini verifier must use `provider: vertex_ai`. Anthropic is
+rejected because its Messages API does not expose token logprobs.
+
+For a `deepseek/` verifier with a custom `base_url`, that endpoint must expose
+the DeepSeek chat-completions behavior transparently: it must accept DeepSeek
+thinking/reasoning parameters and return the requested score tags with token
+logprobs. TurboAgent keeps the DeepSeek-specific scoring path while changing
+the URL. A vLLM or SGLang server that merely hosts DeepSeek weights should use
+the ordinary OpenAI-compatible route instead: omit the prefix, or set
+`provider: openai` explicitly.
 
 ```yaml
 verifier:
@@ -173,7 +233,7 @@ verifier:
 ```yaml
 verifier:
   model:
-    name: openai/Qwen3.5-9B          # or any served model id
+    name: Qwen/Qwen3.5-9B            # or any served model id
     base_url: http://localhost:8000/v1
     api_key: $OPENAI_API_KEY
 ```

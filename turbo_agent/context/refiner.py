@@ -42,6 +42,8 @@ class ContextRefiner:
             response = await llm_completion(
                 model=self.config.model_name,
                 api_key=self.config.api_key,
+                base_url=self.config.base_url,
+                provider=self.config.provider,
                 messages=[{"role": "user", "content": prompt}],
             )
             refined = (

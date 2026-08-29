@@ -84,10 +84,7 @@ class Verifier:
 
     @property
     def client(self):
-        """The llm-verifier client for the configured model — Gemini,
-        DeepSeek, or any OpenAI-compatible logprob server, chosen by the
-        model-name prefix. None lets llm-verifier create one from the
-        environment."""
+        """The client for the configured, validated verifier provider."""
         if not self._client_built:
             self._client = build_verifier_client(self.cfg.model)
             self._client_built = True

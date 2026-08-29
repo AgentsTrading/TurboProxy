@@ -4,6 +4,8 @@ import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
+import anyio
+
 from ..utils import (
     Config,
     AnthropicToOpenAI,
@@ -16,11 +18,28 @@ from ..utils import (
     create_request_log,
     save_request_log,
 )
+from ..utils.config import redact_base_url
+from ..utils.llm import _await_cleanup_task
 from ..context import ContextRefiner
 from ..progress_monitor import ProgressMonitor
 from ..verifier import Verifier
 
 logger = create_logger("backend")
+
+
+async def _close_upstream_stream(
+    stream: Any, primary: Optional[BaseException] = None,
+) -> None:
+    async def close() -> None:
+        await stream.aclose()
+
+    try:
+        with anyio.CancelScope(shield=True):
+            await _await_cleanup_task(asyncio.create_task(close()))
+    except BaseException as cleanup_exc:
+        if primary is None or cleanup_exc is primary:
+            raise
+        raise primary from cleanup_exc
 
 
 class Backend:
@@ -29,7 +48,6 @@ class Backend:
 
     def __init__(self, config: Config):
         self.config = config
-        self._setup_env()
 
         self.refiner: Optional[ContextRefiner] = None
         self.verifier: Optional[Verifier] = None
@@ -52,23 +70,6 @@ class Backend:
         if pm_cfg:
             self.progress_monitor = ProgressMonitor(pm_cfg)
             logger.info(f"Progress monitor enabled (model={pm_cfg.model.name})")
-
-    def _setup_env(self) -> None:
-        import os
-
-        for model in self.config.models:
-            api_key = model.get("api_key", "")
-            if not api_key:
-                continue
-            name = model.get("name", "")
-            if name.startswith("gemini/"):
-                os.environ["GEMINI_API_KEY"] = api_key
-            elif name.startswith("deepseek/"):
-                os.environ["DEEPSEEK_API_KEY"] = api_key
-            elif name.startswith("anthropic/"):
-                os.environ["ANTHROPIC_API_KEY"] = api_key
-            elif name.startswith("openai/"):
-                os.environ["OPENAI_API_KEY"] = api_key
 
     @property
     def model_name(self) -> str:
@@ -101,6 +102,8 @@ class Backend:
         return {
             "model": self.model_name,
             "api_key": self.api_key,
+            "base_url": self.config.default_model.get("base_url") or None,
+            "provider": self.config.default_model.get("provider"),
             **self._parse_model_params(self.config.default_model),
         }
 
@@ -113,6 +116,8 @@ class Backend:
                 "name": model["name"],
                 "api_key": model.get("api_key", ""),
                 **self._parse_model_params(model),
+                "base_url": model.get("base_url") or None,
+                "provider": model.get("provider"),
             }
             for _ in range(num):
                 entries.append(entry)
@@ -120,30 +125,36 @@ class Backend:
 
     def _sanitized_config(self) -> dict:
         raw = dict(self.config.raw_config)
-        if raw.get("backend", {}).get("models"):
+
+        def sanitize_model(model: dict) -> dict:
+            sanitized = {**model, "api_key": "***"}
+            if "base_url" in model:
+                sanitized["base_url"] = redact_base_url(model["base_url"])
+            return sanitized
+
+        backend = raw.get("backend")
+        if isinstance(backend, dict) and backend.get("models"):
             raw["backend"] = {
-                **raw["backend"],
+                **backend,
                 "models": [
-                    {**m, "api_key": "***"} for m in raw["backend"]["models"]
+                    sanitize_model(model) for model in backend["models"]
                 ],
             }
-        if raw.get("context", {}).get("refinement_model"):
-            raw["context"] = {
-                **raw["context"],
-                "refinement_model": {
-                    **raw["context"]["refinement_model"],
-                    "api_key": "***",
-                },
-            }
-        if raw.get("verifier", {}).get("model"):
-            raw["verifier"] = {
-                **raw["verifier"],
-                "model": {**raw["verifier"]["model"], "api_key": "***"},
-            }
-        if raw.get("progress_monitor", {}).get("model"):
-            raw["progress_monitor"] = {
-                **raw["progress_monitor"],
-                "model": {**raw["progress_monitor"]["model"], "api_key": "***"},
+
+        for section, model_key in (
+            ("context", "refinement_model"),
+            ("verifier", "model"),
+            ("progress_monitor", "model"),
+        ):
+            section_config = raw.get(section)
+            if not isinstance(section_config, dict):
+                continue
+            model = section_config.get(model_key)
+            if not isinstance(model, dict):
+                continue
+            raw[section] = {
+                **section_config,
+                model_key: sanitize_model(model),
             }
         return raw
 
@@ -399,8 +410,8 @@ class Backend:
         req_log["request"] = anthropic_body
 
         params = self._build_anthropic_params(anthropic_body)
-        params = await self._refine_messages(params, req_log)
         params.pop("stream", None)
+        params = await self._refine_messages(params, req_log)
 
         if self.verifier:
             logger.info(
@@ -442,6 +453,7 @@ class Backend:
         req_log["request"] = anthropic_body
 
         params = self._build_anthropic_params(anthropic_body)
+        params.pop("stream", None)
         params = await self._refine_messages(params, req_log)
 
         # When the verifier is active, collect all responses, verify, replay.
@@ -465,7 +477,6 @@ class Backend:
                 yield event
             return
 
-        params["stream"] = True
         logger.info(f"BACKEND streaming {self.model_name} (anthropic)")
 
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -479,73 +490,81 @@ class Backend:
         current_tool_id: Optional[str] = None
         output_tokens = 0
 
-        async for chunk in stream:
-            chunk_dict = (
-                chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
-            )
-            choices = chunk_dict.get("choices", [])
-            if not choices:
-                continue
-            choice = choices[0]
-            delta = choice.get("delta", {})
+        try:
+            async for chunk in stream:
+                chunk_dict = (
+                    chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
+                )
+                choices = chunk_dict.get("choices", [])
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta", {})
 
-            usage = chunk_dict.get("usage")
-            if usage and usage.get("completion_tokens"):
-                output_tokens = usage["completion_tokens"]
+                usage = chunk_dict.get("usage")
+                if usage and usage.get("completion_tokens"):
+                    output_tokens = usage["completion_tokens"]
 
-            if delta.get("content"):
-                if not text_block_open:
-                    yield SSEFormatter.content_block_start(block_index, "text")
-                    text_block_open = True
-                yield SSEFormatter.text_delta(block_index, delta["content"])
+                if delta.get("content"):
+                    if not text_block_open:
+                        yield SSEFormatter.content_block_start(block_index, "text")
+                        text_block_open = True
+                    yield SSEFormatter.text_delta(block_index, delta["content"])
 
-            if delta.get("tool_calls"):
-                for tc_delta in delta["tool_calls"]:
-                    tc_id = tc_delta.get("id")
+                if delta.get("tool_calls"):
+                    for tc_delta in delta["tool_calls"]:
+                        tc_id = tc_delta.get("id")
 
-                    if tc_id and tc_id not in tool_blocks:
-                        if text_block_open:
-                            yield SSEFormatter.content_block_stop(block_index)
-                            block_index += 1
-                            text_block_open = False
+                        if tc_id and tc_id not in tool_blocks:
+                            if text_block_open:
+                                yield SSEFormatter.content_block_stop(block_index)
+                                block_index += 1
+                                text_block_open = False
 
-                        tool_blocks[tc_id] = {
-                            "index": block_index,
-                            "name": tc_delta.get("function", {}).get("name", ""),
-                        }
-                        current_tool_id = tc_id
+                            tool_blocks[tc_id] = {
+                                "index": block_index,
+                                "name": tc_delta.get("function", {}).get("name", ""),
+                            }
+                            current_tool_id = tc_id
 
-                        yield SSEFormatter.content_block_start(
-                            block_index,
-                            "tool_use",
-                            tool_id=tc_id,
-                            tool_name=tool_blocks[tc_id]["name"],
-                        )
-
-                    target_id = tc_id or current_tool_id
-                    if target_id and target_id in tool_blocks:
-                        func = tc_delta.get("function", {})
-                        if func.get("arguments"):
-                            yield SSEFormatter.input_json_delta(
-                                tool_blocks[target_id]["index"],
-                                func["arguments"],
+                            yield SSEFormatter.content_block_start(
+                                block_index,
+                                "tool_use",
+                                tool_id=tc_id,
+                                tool_name=tool_blocks[tc_id]["name"],
                             )
 
-            if choice.get("finish_reason"):
-                if text_block_open:
-                    yield SSEFormatter.content_block_stop(block_index)
-                    block_index += 1
-                    text_block_open = False
+                        target_id = tc_id or current_tool_id
+                        if target_id and target_id in tool_blocks:
+                            func = tc_delta.get("function", {})
+                            if func.get("arguments"):
+                                yield SSEFormatter.input_json_delta(
+                                    tool_blocks[target_id]["index"],
+                                    func["arguments"],
+                                )
 
-                for tinfo in tool_blocks.values():
-                    yield SSEFormatter.content_block_stop(tinfo["index"])
-                    block_index += 1
+                if choice.get("finish_reason"):
+                    if text_block_open:
+                        yield SSEFormatter.content_block_stop(block_index)
+                        block_index += 1
+                        text_block_open = False
 
-                stop_reason = STOP_REASON_MAP.get(
-                    choice["finish_reason"], "end_turn"
-                )
-                yield SSEFormatter.message_delta(stop_reason, output_tokens)
-                yield SSEFormatter.message_stop()
+                    for tinfo in tool_blocks.values():
+                        yield SSEFormatter.content_block_stop(tinfo["index"])
+                        block_index += 1
+
+                    stop_reason = STOP_REASON_MAP.get(
+                        choice["finish_reason"], "end_turn"
+                    )
+                    yield SSEFormatter.message_delta(stop_reason, output_tokens)
+                    yield SSEFormatter.message_stop()
+        except BaseException as exc:
+            await _close_upstream_stream(
+                stream, None if isinstance(exc, GeneratorExit) else exc,
+            )
+            raise
+        else:
+            await _close_upstream_stream(stream)
 
     async def _replay_anthropic_sse(
         self, response: dict, model_name: str,
@@ -670,6 +689,7 @@ class Backend:
         req_log["request"] = openai_body
 
         params = self._build_openai_params(openai_body)
+        params.pop("stream", None)
         params = await self._refine_messages(params, req_log)
 
         if self.verifier:
@@ -692,15 +712,22 @@ class Backend:
                 yield event
             return
 
-        params["stream"] = True
         logger.info(f"BACKEND streaming {self.model_name} (openai)")
 
         stream = await llm_stream_completion(**params)
-        async for chunk in stream:
-            chunk_dict = (
-                chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
+        try:
+            async for chunk in stream:
+                chunk_dict = (
+                    chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
+                )
+                yield f"data: {json.dumps(chunk_dict, default=str)}\n\n"
+        except BaseException as exc:
+            await _close_upstream_stream(
+                stream, None if isinstance(exc, GeneratorExit) else exc,
             )
-            yield f"data: {json.dumps(chunk_dict, default=str)}\n\n"
+            raise
+        else:
+            await _close_upstream_stream(stream)
 
         yield "data: [DONE]\n\n"
 

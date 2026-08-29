@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Check every API provider TurboAgent supports and report whether its key works.
+Check every API provider TurboProxy supports and report whether its key works.
 
 For each provider it loads the key from the environment (or the ``.env`` next to
-``turbo-agent.yaml``), makes one minimal live request, and prints a status:
+``turbo-proxy.yaml``), makes one minimal live request, and prints a status:
 
     ✅ working      key authenticated and the call succeeded
     ❌ failing      key is missing/expired/invalid (auth error)
@@ -14,7 +14,7 @@ Vertex AI and DeepSeek checks for verifier/progress models also confirm token
 logprobs are returned, since those scoring paths depend on them.
 
 Usage:
-    turbo-agent check
+    turbo-proxy check
 """
 
 import asyncio
@@ -29,7 +29,7 @@ from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlsplit, urluns
 
 import httpx
 
-from turbo_agent.utils.config import (
+from turbo_proxy.utils.config import (
     ModelConfig,
     load_yaml_mapping,
     resolve_api_key,
@@ -43,7 +43,7 @@ from turbo_agent.utils.config import (
     validate_litellm_api_key,
     validate_litellm_endpoint,
 )
-from turbo_agent.utils.verifier_client import (
+from turbo_proxy.utils.verifier_client import (
     _append_url_path,
     _normalise_base_url,
     _openai_api_base_url,
@@ -51,7 +51,7 @@ from turbo_agent.utils.verifier_client import (
     verifier_model_id,
 )
 
-# .env and turbo-agent.yaml are resolved from the directory the user runs in.
+# .env and turbo-proxy.yaml are resolved from the directory the user runs in.
 ROOT = Path.cwd()
 
 # Keywords that mark an error as an authentication / key problem (vs. anything
@@ -748,7 +748,7 @@ class LiteLLMVertexChecker(ProviderChecker):
     def validate(self, key: str) -> Tuple[str, str]:
         # Import lazily so checks that do not use LiteLLM Vertex avoid loading
         # its provider registry. This is the exact wrapper used in production.
-        from turbo_agent.utils.llm import llm_completion
+        from turbo_proxy.utils.llm import llm_completion
 
         response = asyncio.run(asyncio.wait_for(
             llm_completion(
@@ -791,7 +791,7 @@ class LiteLLMEndpointChecker(ProviderChecker):
         self.name = name
 
     def validate(self, key: str) -> Tuple[str, str]:
-        from turbo_agent.utils.llm import llm_completion
+        from turbo_proxy.utils.llm import llm_completion
 
         response = asyncio.run(asyncio.wait_for(
             llm_completion(
@@ -853,7 +853,7 @@ def _config_usage() -> Tuple[dict, List[ProviderChecker]]:
     litellm_vertex_specs: Dict[
         Tuple[str, Optional[str], Optional[str]], List[str]
     ] = {}
-    config_path = ROOT / "turbo-agent.yaml"
+    config_path = ROOT / "turbo-proxy.yaml"
     if not config_path.exists():
         return roles, []
 
@@ -1328,7 +1328,7 @@ def main() -> int:
     if include_official(anthropic):
         checkers.append(anthropic)
 
-    print("Checking TurboAgent provider API keys\n" + "─" * 60)
+    print("Checking TurboProxy provider API keys\n" + "─" * 60)
     results = [c.run() for c in checkers]
     for r in results:
         print(r.line())

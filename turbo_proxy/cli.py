@@ -8,7 +8,7 @@ from .proxy import ProxyServer
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Turbo Agent Proxy")
+    parser = argparse.ArgumentParser(description="Turbo Proxy")
     parser.add_argument("-p", "--port", type=int, default=8888)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     subparsers = parser.add_subparsers(dest="command")
@@ -22,7 +22,7 @@ def main() -> None:
 
     server = ProxyServer()
 
-    logger.info("=== Turbo Agent Proxy ===")
+    logger.info("=== Turbo Proxy ===")
     logger.info(f"Listening on http://localhost:{args.port}")
     logger.info(f"Backend model: {server.backend.model_name}")
     logger.info("Anthropic: POST /v1/messages")

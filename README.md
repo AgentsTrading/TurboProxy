@@ -1,8 +1,8 @@
-# Turbo Agent
+# Turbo Proxy
 
-![Turbo Agent visualizer](screenshot.png)
+![Turbo Proxy visualizer](screenshot.png)
 
-Turbo Agent is the Claude Code plugin for LLM-as-a-Verifier. It implements an LLM API proxy that improves response quality through concurrent inference, verification, and refinement. It sits between your client (Claude Code, Codex, etc.) and the LLM provider, sending multiple parallel requests and selecting the best response with a **Probabilistic Pivot Tournament (PPT)** scored by a fine-grained logprob verifier.
+Turbo Proxy is the Claude Code plugin for LLM-as-a-Verifier. It implements an LLM API proxy that improves response quality through concurrent inference, verification, and refinement. It sits between your client (Claude Code, Codex, etc.) and the LLM provider, sending multiple parallel requests and selecting the best response with a **Probabilistic Pivot Tournament (PPT)** scored by a fine-grained logprob verifier.
 
 ```
 Client request
@@ -21,7 +21,7 @@ Verification uses the pivot tournament from the [`llm-verifier`](https://pypi.or
 ## Install
 
 ```bash
-pip install turbo-agent
+pip install turbo-proxy
 ```
 
 Or from source:
@@ -32,9 +32,9 @@ pip install -e .
 
 ## Setup
 
-For turbo agent to work, you need a `turbo-agent.yaml`. You can copy the reference file in this repo.
+For Turbo Proxy to work, you need a `turbo-proxy.yaml`. You can copy the reference file in this repo.
 
-`turbo-agent.yaml` references keys with `$VAR_NAME` syntax. The recommended way to provide them is a `.env` file in the project root (next to `turbo-agent.yaml`) — the proxy loads it automatically on startup. Copy the committed template and fill in your keys:
+`turbo-proxy.yaml` references keys with `$VAR_NAME` syntax. The recommended way to provide them is a `.env` file in the project root (next to `turbo-proxy.yaml`) — the proxy loads it automatically on startup. Copy the committed template and fill in your keys:
 
 ```bash
 cp .env.example .env
@@ -63,7 +63,7 @@ replacement for ADC on that backend path.
 Verify your keys are valid:
 
 ```bash
-turbo-agent check
+turbo-proxy check
 ```
 
 It checks every supported provider (Gemini, Vertex AI, DeepSeek, OpenAI,
@@ -74,8 +74,8 @@ also confirm the backend returns the token logprobs those scoring paths need.
 ## Run
 
 ```bash
-turbo-agent                   # default port 8888
-turbo-agent -p 9000           # custom port
+turbo-proxy                   # default port 8888
+turbo-proxy -p 9000           # custom port
 ```
 
 ### Use with Claude Code
@@ -113,9 +113,9 @@ no plugin is needed — point one at the proxy in `opencode.json`:
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "turbo-agent": {
+    "turbo-proxy": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Turbo Agent",
+      "name": "Turbo Proxy",
       "options": {
         "baseURL": "http://localhost:8888/v1",
         "apiKey": "unused"
@@ -128,12 +128,12 @@ no plugin is needed — point one at the proxy in `opencode.json`:
 }
 ```
 
-Run `turbo-agent` in one terminal, then `opencode` in another and pick the
+Run `turbo-proxy` in one terminal, then `opencode` in another and pick the
 model with `/models`.
 
 Two things to know:
 
-- The model id must match a `backend.models[].name` in your `turbo-agent.yaml`
+- The model id must match a `backend.models[].name` in your `turbo-proxy.yaml`
   — that is what `GET /v1/models` reports. The proxy routes on its own config,
   not on the model in the request.
 - With the verifier on, the proxy answers once the tournament has picked a
@@ -154,8 +154,8 @@ export OPENAI_API_BASE=http://localhost:8888/v1
 
 ## Configuration
 
-Edit `turbo-agent.yaml`. API keys and `base_url` values can reference environment
-variables with `$VAR_NAME` syntax. See the reference `turbo-agent.yaml` file for
+Edit `turbo-proxy.yaml`. API keys and `base_url` values can reference environment
+variables with `$VAR_NAME` syntax. See the reference `turbo-proxy.yaml` file for
 reference and usage.
 
 ### Model prefixes
@@ -218,7 +218,7 @@ rejected because its Messages API does not expose token logprobs.
 For a `deepseek/` verifier with a custom `base_url`, that endpoint must expose
 the DeepSeek chat-completions behavior transparently: it must accept DeepSeek
 thinking/reasoning parameters and return the requested score tags with token
-logprobs. TurboAgent keeps the DeepSeek-specific scoring path while changing
+logprobs. Turbo Proxy keeps the DeepSeek-specific scoring path while changing
 the URL. A vLLM or SGLang server that merely hosts DeepSeek weights should use
 the ordinary OpenAI-compatible route instead: omit the prefix, or set
 `provider: openai` explicitly.

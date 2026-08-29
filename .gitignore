@@ -14,10 +14,10 @@ build/
 .env
 
 # Runtime logs
-.turbo-agent*/
+.turbo-proxy*/
 
 # Frontend
 node_modules/
 /.pnp*
 /.yarn
-turbo_agent/visualizer-dist/
+turbo_proxy/visualizer-dist/

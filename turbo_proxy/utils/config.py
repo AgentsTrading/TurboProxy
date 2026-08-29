@@ -77,7 +77,7 @@ def validate_litellm_endpoint(
     if provider not in _IMPLICIT_BASE_URL_PROVIDERS:
         raise ValueError(
             f"provider '{provider}' requires an explicit model-level base_url "
-            "(and provider when no supported prefix exists); TurboAgent cannot "
+            "(and provider when no supported prefix exists); TurboProxy cannot "
             "isolate its credentials from process-wide endpoint overrides "
             f"otherwise ({field_name})"
         )
@@ -388,12 +388,12 @@ _DEFAULT_CRITERIA = [
 class Config:
     def __init__(self, config_path: Optional[str] = None):
         if config_path is None:
-            config_path = str(Path.cwd() / "turbo-agent.yaml")
+            config_path = str(Path.cwd() / "turbo-proxy.yaml")
             if not Path(config_path).exists():
                 raise FileNotFoundError(
-                    f"No turbo-agent.yaml found in {Path.cwd()}. "
-                    "Run turbo-agent from a directory containing a "
-                    "turbo-agent.yaml config file."
+                    f"No turbo-proxy.yaml found in {Path.cwd()}. "
+                    "Run turbo-proxy from a directory containing a "
+                    "turbo-proxy.yaml config file."
                 )
 
         # Load .env from the same directory as the config file.
@@ -633,7 +633,7 @@ class Config:
     @property
     def log_dir(self) -> str:
         dir_name = self._raw.get("log_dir", "default")
-        return str(Path(".turbo-agent") / dir_name)
+        return str(Path(".turbo-proxy") / dir_name)
 
     @property
     def raw_config(self) -> Dict[str, Any]:

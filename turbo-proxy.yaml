@@ -1,4 +1,4 @@
-log_dir: default  # request logs go to .turbo-agent/<log_dir>/
+log_dir: default  # request logs go to .turbo-proxy/<log_dir>/
 
 backend:
   models:

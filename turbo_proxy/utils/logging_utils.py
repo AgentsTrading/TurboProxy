@@ -41,7 +41,7 @@ class Logger:
             )
 
 
-logger = Logger("turbo_agent")
+logger = Logger("turbo_proxy")
 
 
 def create_logger(name: str) -> Logger:

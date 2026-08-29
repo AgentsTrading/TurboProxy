@@ -7,7 +7,7 @@ import httpx
 import pytest
 import yaml
 
-import turbo_agent.check_api_key as check_api_key
+import turbo_proxy.check_api_key as check_api_key
 
 
 _PROVIDER_ENV_VARS = (
@@ -30,7 +30,7 @@ def _isolate_provider_environment(monkeypatch):
 
 
 def _configure(tmp_path, monkeypatch, models):
-    (tmp_path / "turbo-agent.yaml").write_text(
+    (tmp_path / "turbo-proxy.yaml").write_text(
         yaml.safe_dump({"backend": {"models": models}})
     )
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
@@ -253,7 +253,7 @@ def test_custom_litellm_endpoint_uses_the_production_completion_route(
             "refinement_prompt": "Refine this context.",
             "refinement_model": model_config,
         }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     calls = []
 
@@ -262,7 +262,7 @@ def test_custom_litellm_endpoint_uses_the_production_completion_route(
         return {"choices": [{"message": {"content": "ok"}}]}
 
     monkeypatch.setattr(
-        "turbo_agent.utils.llm.llm_completion",
+        "turbo_proxy.utils.llm.llm_completion",
         fake_completion,
     )
     monkeypatch.setattr(
@@ -462,7 +462,7 @@ def test_main_checks_verifier_and_progress_monitor_custom_endpoints(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     for env_var in _PROVIDER_ENV_VARS:
         monkeypatch.delenv(env_var, raising=False)
@@ -536,7 +536,7 @@ def test_standard_deepseek_verifier_checks_configured_score_protocol(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     for env_var in _PROVIDER_ENV_VARS:
         monkeypatch.delenv(env_var, raising=False)
@@ -624,7 +624,7 @@ def test_standard_openai_progress_checks_configured_score_protocol(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     for env_var in _PROVIDER_ENV_VARS:
         monkeypatch.delenv(env_var, raising=False)
@@ -671,7 +671,7 @@ def test_standard_vertex_checker_uses_the_configured_model(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     monkeypatch.setenv("VERTEX_API_KEY", "vertex-secret")
 
@@ -697,7 +697,7 @@ def test_custom_vertex_logprob_checker_allows_adc_without_api_key(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
 
     roles, checkers = check_api_key._config_usage()
@@ -767,7 +767,7 @@ def test_custom_vertex_logprob_checker_uses_vertex_key_and_deduplicates(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     for env_var in _PROVIDER_ENV_VARS:
         monkeypatch.delenv(env_var, raising=False)
@@ -802,7 +802,7 @@ def test_custom_vertex_backend_checker_forces_adc(
             }]
         }
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     monkeypatch.setenv("VERTEX_API_KEY", "must-not-be-used-by-backend")
 
@@ -829,7 +829,7 @@ def test_standard_vertex_backend_whitespace_key_uses_litellm_adc(
             }]
         }
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
 
     roles, checkers = check_api_key._config_usage()
@@ -884,7 +884,7 @@ def test_standard_verifier_strips_environment_reference_whitespace(
     tmp_path, monkeypatch, model, checker_cls,
 ):
     model = {**model, "api_key": " $PADDED_KEY "}
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump({
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump({
         "backend": {"models": [{"name": "openai/gpt-4o"}]},
         "verifier": {"model": model},
     }))
@@ -914,7 +914,7 @@ def test_litellm_vertex_checker_uses_the_production_completion_wrapper(
         return {"choices": [{"message": {"content": "ok"}}]}
 
     monkeypatch.setattr(
-        "turbo_agent.utils.llm.llm_completion", fake_completion
+        "turbo_proxy.utils.llm.llm_completion", fake_completion
     )
     checker = check_api_key.LiteLLMVertexChecker(
         ("backend", "context"),
@@ -1063,7 +1063,7 @@ def test_main_requires_base_url_for_unpinned_litellm_provider(
     monkeypatch.setattr(check_api_key.httpx, "get", unexpected_call)
     monkeypatch.setattr(check_api_key.httpx, "post", unexpected_call)
     monkeypatch.setattr(
-        "turbo_agent.utils.llm.llm_completion",
+        "turbo_proxy.utils.llm.llm_completion",
         unexpected_call,
     )
 
@@ -1316,7 +1316,7 @@ def test_main_rejects_invalid_openai_base_url_environment_before_request(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     monkeypatch.setenv("OPENAI_BASE_URL", "not-a-url")
 
@@ -1336,7 +1336,7 @@ def test_malformed_yaml_does_not_echo_literal_secrets(
     tmp_path, monkeypatch, capsys,
 ):
     secret = "literal-credential-that-must-never-appear"
-    (tmp_path / "turbo-agent.yaml").write_text(
+    (tmp_path / "turbo-proxy.yaml").write_text(
         "backend:\n  models:\n    - name: openai/test\n"
         f"      api_key: [{secret}\n"
     )
@@ -1369,7 +1369,7 @@ def test_malformed_yaml_does_not_echo_literal_secrets(
 def test_main_reuses_runtime_structure_validation(
     tmp_path, monkeypatch, capsys, raw_config, expected_error,
 ):
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     monkeypatch.setattr(
         check_api_key.httpx,
@@ -1416,7 +1416,7 @@ def test_custom_deepseek_verifier_never_checks_the_official_origin(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     for env_var in _PROVIDER_ENV_VARS:
         monkeypatch.delenv(env_var, raising=False)
@@ -1562,7 +1562,7 @@ def test_main_fails_when_configured_verifier_protocol_is_unverified(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     for env_var in _PROVIDER_ENV_VARS:
         monkeypatch.delenv(env_var, raising=False)
@@ -1591,7 +1591,7 @@ def test_plain_gemini_verifier_is_rejected_before_http(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
     calls = _record_gets(monkeypatch)
@@ -1614,7 +1614,7 @@ def test_official_openai_tournament_verifier_is_rejected_before_http(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     calls = _record_gets(monkeypatch)
@@ -1638,7 +1638,7 @@ def test_explicit_official_openai_base_url_tournament_verifier_is_rejected(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     calls = []
     monkeypatch.setattr(
@@ -1686,7 +1686,7 @@ def test_unsupported_standard_verifier_provider_is_rejected_before_http(
             }
         },
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     calls = _record_gets(monkeypatch)
 
@@ -1703,7 +1703,7 @@ def test_unknown_verifier_provider_is_rejected_before_environment_fallback(
         "backend": {"models": [{"name": "openai/gpt-4o"}]},
         "verifier": {"model": {"name": "unrecognized/verifier-model"}},
     }
-    (tmp_path / "turbo-agent.yaml").write_text(yaml.safe_dump(raw_config))
+    (tmp_path / "turbo-proxy.yaml").write_text(yaml.safe_dump(raw_config))
     monkeypatch.setattr(check_api_key, "ROOT", tmp_path)
     monkeypatch.setenv("OPENAI_BASE_URL", "https://untrusted.example/v1")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "must-not-be-forwarded")

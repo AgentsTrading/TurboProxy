@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "turbo-agent"
+name = "turbo-proxy"
 version = "0.2.1"
 description = "An LLM API proxy that improves response quality through concurrent inference, pivot-tournament verification, and context refinement."
 readme = "README.md"
@@ -23,13 +23,13 @@ dependencies = [
 ]
 
 [project.scripts]
-turbo-agent = "turbo_agent.cli:main"
+turbo-proxy = "turbo_proxy.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["turbo_agent*"]
+include = ["turbo_proxy*"]
 
 [tool.setuptools.package-data]
-turbo_agent = ["visualizer-dist/**/*"]
+turbo_proxy = ["visualizer-dist/**/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

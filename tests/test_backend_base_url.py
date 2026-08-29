@@ -11,22 +11,22 @@ import httpx
 import pytest
 import yaml
 
-import turbo_agent.proxy.backend as backend_module
-import turbo_agent.context.refiner as refiner_module
-import turbo_agent.utils.llm as llm_module
-from turbo_agent.context.refiner import ContextRefiner
-from turbo_agent.proxy.backend import Backend
-from turbo_agent.utils import Config
+import turbo_proxy.proxy.backend as backend_module
+import turbo_proxy.context.refiner as refiner_module
+import turbo_proxy.utils.llm as llm_module
+from turbo_proxy.context.refiner import ContextRefiner
+from turbo_proxy.proxy.backend import Backend
+from turbo_proxy.utils import Config
 
 
 def _config(tmp_path, models):
-    config_path = tmp_path / "turbo-agent.yaml"
+    config_path = tmp_path / "turbo-proxy.yaml"
     config_path.write_text(yaml.safe_dump({"backend": {"models": models}}))
     return Config(str(config_path))
 
 
 def _config_from_raw(tmp_path, raw_config):
-    config_path = tmp_path / "turbo-agent.yaml"
+    config_path = tmp_path / "turbo-proxy.yaml"
     config_path.write_text(yaml.safe_dump(raw_config))
     return Config(str(config_path))
 
@@ -814,7 +814,7 @@ def test_config_rejects_other_litellm_provider_without_base_url(
 def test_config_rejects_unknown_provider_without_explicit_routing(
     tmp_path, section, config_property, field_name,
 ):
-    model = {"name": "unrecognized/turboagent-unknown-model"}
+    model = {"name": "unrecognized/turboproxy-unknown-model"}
     raw_config = {
         "backend": {"models": [{"name": "openai/gpt-4o-mini"}]},
     }
@@ -849,7 +849,7 @@ def test_unknown_provider_fails_before_completion_or_http(
     monkeypatch.setattr(httpx.AsyncClient, "send", send)
 
     kwargs = {
-        "model": "unrecognized/turboagent-unknown-model",
+        "model": "unrecognized/turboproxy-unknown-model",
         "messages": [{"role": "user", "content": "hello"}],
     }
     with pytest.raises(ValueError) as exc_info:
@@ -1923,7 +1923,7 @@ def test_litellm_vertex_api_key_is_rejected(
 
 
 def test_reference_config_uses_gemini_key_for_litellm_backend():
-    config_path = Path(__file__).parents[1] / "turbo-agent.yaml"
+    config_path = Path(__file__).parents[1] / "turbo-proxy.yaml"
     raw = yaml.safe_load(config_path.read_text())
     backend_model = raw["backend"]["models"][0]
 

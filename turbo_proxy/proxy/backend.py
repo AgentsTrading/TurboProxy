@@ -761,7 +761,7 @@ class Backend:
                     "id": model["name"],
                     "object": "model",
                     "created": 0,
-                    "owned_by": "turbo-agent",
+                    "owned_by": "turbo-proxy",
                 }
                 for model in self.config.models
             ],

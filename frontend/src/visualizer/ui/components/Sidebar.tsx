@@ -45,7 +45,7 @@ export default function Sidebar({
         padding: '14px 16px', borderBottom: '1px solid #1e293b',
         fontSize: 14, fontWeight: 700, color: '#e2e8f0',
       }}>
-        Turbo Agent Logs
+        Turbo Proxy Logs
         <span style={{ color: '#64748b', fontWeight: 400, fontSize: 12, marginLeft: 8 }}>
           ({entries.length})
         </span>
@@ -95,7 +95,7 @@ export default function Sidebar({
         })}
         {entries.length === 0 && (
           <div style={{ padding: 16, color: '#64748b', fontSize: 12, textAlign: 'center' }}>
-            No logs found in .turbo-agent/
+            No logs found in .turbo-proxy/
           </div>
         )}
       </div>

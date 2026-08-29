@@ -10,11 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from turbo_agent.utils import (  # noqa: E402
+from turbo_proxy.utils import (  # noqa: E402
     Config, ModelConfig, build_verifier_client, verifier_model_id,
 )
-from turbo_agent.verifier.verifier import Verifier  # noqa: E402
-from turbo_agent.utils.verifier_client import (  # noqa: E402
+from turbo_proxy.verifier.verifier import Verifier  # noqa: E402
+from turbo_proxy.utils.verifier_client import (  # noqa: E402
     _append_base_query,
     _url_origin,
 )
@@ -425,7 +425,7 @@ def test_official_openai_is_rejected_as_tournament_verifier():
     [
         "https://api.openai.com/v1",
         "https://api.openai.com/v1/",
-        "https://API.OPENAI.COM/v1?source=turbo-agent",
+        "https://API.OPENAI.COM/v1?source=turbo-proxy",
         "https://api.openai.com./v1",
     ],
 )
@@ -941,14 +941,14 @@ verifier:
     api_key: test-key
 """
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "turbo-agent.yaml"
+        path = Path(tmp) / "turbo-proxy.yaml"
         path.write_text(yaml_text)
         cfg = Config(str(path))
         assert cfg.verifier_config.model.base_url == "http://localhost:9001/v1"
 
 
 def _verifier_config(model_name):
-    from turbo_agent.utils import (CriterionConfig, PivotTournamentConfig,
+    from turbo_proxy.utils import (CriterionConfig, PivotTournamentConfig,
                                    VerifierConfig)
     return VerifierConfig(
         model=ModelConfig(model_name, api_key="test-key"),

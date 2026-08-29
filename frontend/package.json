@@ -1,7 +1,7 @@
 {
-  "name": "turbo-agent-visualizer",
+  "name": "turbo-proxy-visualizer",
   "version": "0.1.0",
-  "description": "Turbo Agent pipeline visualizer frontend",
+  "description": "Turbo Proxy pipeline visualizer frontend",
   "type": "module",
   "scripts": {
     "build": "vite build",

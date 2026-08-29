@@ -70,7 +70,7 @@ export default function App() {
             flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
             color: '#64748b', fontSize: 14, flexDirection: 'column', gap: 8,
           }}>
-            <div style={{ fontSize: 32 }}>Turbo Agent Visualizer</div>
+            <div style={{ fontSize: 32 }}>Turbo Proxy Visualizer</div>
             <div>Select a log entry from the sidebar</div>
           </div>
         )}

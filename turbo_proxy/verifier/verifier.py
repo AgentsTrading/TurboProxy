@@ -6,7 +6,7 @@ Given the conversation history and N candidate responses, `llm_verifier.select`
 scores directed pairs (candidate `a` in slot A, `b` in slot B) with the
 fine-grained logprob reward and aggregates them through a Probabilistic Pivot
 Tournament (PPT) to pick the best candidate in O(N·k) comparisons rather than
-the O(N^2) of full round-robin. This module wraps that call with TurboAgent's
+the O(N^2) of full round-robin. This module wraps that call with TurboProxy's
 config, majority-voting shortcut, and the per-comparison records the
 visualizer displays.
 """

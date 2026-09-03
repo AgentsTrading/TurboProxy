@@ -1266,6 +1266,144 @@ def test_owned_query_stream_can_close_before_consumption(monkeypatch):
     client.close.assert_awaited_once()
 
 
+def test_owned_stream_closes_litellm_fallback_before_consumption():
+    class CloseTrackedWrapper:
+        def __init__(self):
+            self.closed = 0
+
+        async def aclose(self):
+            self.closed += 1
+
+    class LiteLLMFallbackStream:
+        def __init__(self, wrapper):
+            self.litellm_custom_stream_wrapper = wrapper
+            self.iterator_calls = 0
+
+        def __aiter__(self):
+            self.iterator_calls += 1
+            return self
+
+        async def __anext__(self):
+            raise AssertionError("stream should not be consumed")
+
+    wrapper = CloseTrackedWrapper()
+    source = LiteLLMFallbackStream(wrapper)
+    client = Mock()
+    client.close = AsyncMock()
+    stream = llm_module._OwnedClientStream(source, client)
+
+    async def close_twice():
+        await stream.aclose()
+        await stream.aclose()
+
+    asyncio.run(close_twice())
+
+    assert source.iterator_calls == 0
+    assert wrapper.closed == 1
+    client.close.assert_awaited_once()
+
+
+def test_owned_stream_closes_litellm_fallback_after_read_error():
+    class CloseTrackedWrapper:
+        def __init__(self):
+            self.closed = 0
+
+        async def aclose(self):
+            self.closed += 1
+
+    class LiteLLMFallbackStream:
+        def __init__(self, wrapper):
+            self.litellm_custom_stream_wrapper = wrapper
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise httpx.ReadError("upstream read failed")
+
+    wrapper = CloseTrackedWrapper()
+    client = Mock()
+    client.close = AsyncMock()
+    stream = llm_module._OwnedClientStream(
+        LiteLLMFallbackStream(wrapper), client
+    )
+
+    with pytest.raises(httpx.ReadError, match="upstream read failed"):
+        asyncio.run(stream.__anext__())
+
+    assert wrapper.closed == 1
+    client.close.assert_awaited_once()
+
+
+def test_owned_stream_preserves_error_when_nested_close_fails():
+    class RetryableCloseWrapper:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("nested close failed")
+
+    class FailingLiteLLMStream:
+        def __init__(self, wrapper):
+            self.litellm_custom_stream_wrapper = wrapper
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise ValueError("upstream failed")
+
+    wrapper = RetryableCloseWrapper()
+    client = Mock()
+    client.close = AsyncMock()
+    stream = llm_module._OwnedClientStream(
+        FailingLiteLLMStream(wrapper), client
+    )
+
+    async def read_then_retry_close():
+        with pytest.raises(ValueError, match="upstream failed") as exc_info:
+            await stream.__anext__()
+        await stream.aclose()
+        await stream.aclose()
+        return exc_info.value
+
+    error = asyncio.run(read_then_retry_close())
+
+    assert isinstance(error.__cause__, RuntimeError)
+    assert str(error.__cause__) == "nested close failed"
+    assert wrapper.close_calls == 2
+    client.close.assert_awaited_once()
+
+
+def test_owned_stream_cleans_up_when_first_iterator_acquisition_fails():
+    class FailingIterable:
+        def __init__(self):
+            self.iterator_calls = 0
+            self.closed = 0
+
+        def __aiter__(self):
+            self.iterator_calls += 1
+            raise ValueError("iterator creation failed")
+
+        async def aclose(self):
+            self.closed += 1
+
+    source = FailingIterable()
+    client = Mock()
+    client.close = AsyncMock()
+    stream = llm_module._OwnedClientStream(source, client)
+
+    assert source.iterator_calls == 0
+    with pytest.raises(ValueError, match="iterator creation failed"):
+        asyncio.run(stream.__anext__())
+
+    assert source.iterator_calls == 1
+    assert source.closed == 1
+    client.close.assert_awaited_once()
+
+
 def test_owned_query_stream_closes_inside_cancelled_anyio_scope():
     class CloseTrackedStream:
         def __init__(self):
@@ -1802,6 +1940,108 @@ def test_context_refiner_forwards_base_url_and_provider(tmp_path, monkeypatch):
     assert completion.await_args.kwargs["provider"] == "openai"
     assert completion.await_args.kwargs["base_url"] == "https://context.example/v1"
     assert completion.await_args.kwargs["api_key"] == "context-key"
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (None, None),
+        ({"type": "text", "text": ""}, None),
+        ({"content": []}, None),
+        ([{"type": "text", "text": ""}], None),
+        ([{"type": "text", "text": "refined"}], "refined"),
+        (["first", {"text": "second"}], "first\nsecond"),
+        ({"content": "refined"}, "refined"),
+    ],
+)
+def test_context_refiner_normalizes_non_string_content(
+    tmp_path, monkeypatch, content, expected,
+):
+    config_path = tmp_path / "context-content-shapes.yaml"
+    config_path.write_text(
+        yaml.safe_dump({
+            "backend": {"models": [{"name": "openai/backend-model"}]},
+            "context": {
+                "refinement_model": {
+                    "name": "openai/context-model",
+                    "api_key": "context-key",
+                },
+                "refinement_prompt": "Refine {context}",
+            },
+        })
+    )
+    context_config = Config(str(config_path)).context_config
+    completion = AsyncMock(return_value={
+        "choices": [{"message": {"content": content}}]
+    })
+    monkeypatch.setattr(refiner_module, "llm_completion", completion)
+    messages = [{"role": "user", "content": "hello"}]
+
+    refined = asyncio.run(ContextRefiner(context_config).refine(messages))
+
+    if expected is None:
+        assert refined == messages
+    else:
+        assert refined[0] == {
+            "role": "system",
+            "content": expected,
+        }
+        assert refined[1:] == messages
+
+
+def test_context_refiner_normalizes_existing_system_content_parts(
+    tmp_path, monkeypatch,
+):
+    config_path = tmp_path / "context-system-content-parts.yaml"
+    config_path.write_text(
+        yaml.safe_dump({
+            "backend": {"models": [{"name": "openai/backend-model"}]},
+            "context": {
+                "refinement_model": {
+                    "name": "openai/context-model",
+                    "api_key": "context-key",
+                },
+                "refinement_prompt": "Refine {context}",
+            },
+        })
+    )
+    context_config = Config(str(config_path)).context_config
+    completion = AsyncMock(return_value={
+        "choices": [{"message": {"content": "refined"}}]
+    })
+    monkeypatch.setattr(refiner_module, "llm_completion", completion)
+    messages = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "first policy"},
+                {"type": "text", "text": "second policy"},
+            ],
+        },
+        {"role": "user", "content": "hello"},
+    ]
+
+    refined = asyncio.run(ContextRefiner(context_config).refine(messages))
+
+    assert refined[0] == {
+        "role": "system",
+        "content": "refined\n\nfirst policy\nsecond policy",
+    }
+    assert refined[1:] == messages[1:]
+
+
+def test_context_refiner_replaces_audio_payload_with_placeholder():
+    audio_data = "SECRET-AUDIO-DATA" * 100
+    formatted = ContextRefiner._format_messages([{
+        "role": "user",
+        "content": [{
+            "type": "input_audio",
+            "input_audio": {"data": audio_data, "format": "wav"},
+        }],
+    }])
+
+    assert formatted == "USER: [audio]"
+    assert audio_data not in formatted
 
 
 def test_custom_endpoint_key_does_not_replace_global_provider_key(

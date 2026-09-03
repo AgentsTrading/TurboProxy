@@ -244,6 +244,7 @@ verifier:
 |----------|--------|
 | `POST /v1/messages` | Anthropic |
 | `POST /v1/chat/completions` | OpenAI |
+| `POST /v1/responses` | OpenAI Responses |
 | `GET /v1/models` | OpenAI |
 | `GET /visualizer` | Pipeline visualizer UI |
 | `*` | Upstream passthrough to api.anthropic.com |

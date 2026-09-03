@@ -5,7 +5,10 @@ provider-specific API formatting, and cross-provider tool call compatibility.
 """
 
 import asyncio
+import json
+import math
 import os
+from numbers import Real
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -85,6 +88,8 @@ _PROTECTED_LITELLM_KWARGS = {
 }
 
 _CHAT_COMPLETIONS_PATH = "chat/completions"
+_RESPONSES_PATH = "responses"
+_OPENAI_CHAT_COMPLETIONS_RESPONSES_PREFIX = "openai/chat_completions/"
 _URL_JOINING_PROVIDERS = {"deepseek"}
 _QUERY_CLIENT_PROVIDERS = {"anthropic", "gemini", "vertex_ai"}
 _PROVIDER_DEFAULT_BASE_URLS = {
@@ -93,6 +98,8 @@ _PROVIDER_DEFAULT_BASE_URLS = {
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
     "anthropic": "https://api.anthropic.com",
 }
+
+_MISSING_RESPONSES_INPUT = object()
 
 
 class _OpenAIQueryBaseURL(str):
@@ -134,12 +141,56 @@ class _EndpointAwareURL(str):
         return path.endswith(suffix, start, len(path) if end is None else end)
 
 
+def _encode_query_mapping(query: Optional[Dict[str, Any]]) -> bytes:
+    """Encode extra query parameters using HTTPX's URL query rules."""
+    if not query:
+        return b""
+    try:
+        encoded = str(httpx.QueryParams(query))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "extra_query values must be URL-query-compatible"
+        ) from exc
+    return encoded.encode("ascii")
+
+
+def _join_raw_queries(*queries: bytes) -> bytes:
+    """Combine raw query fragments without decoding or reordering them."""
+    return b"&".join(query for query in queries if query)
+
+
+def _merge_query_params(base_query: bytes, extra_query: bytes) -> bytes:
+    """Merge URL queries with request-level values taking precedence.
+
+    ``extra_query`` is supplied for one call, so a key there should replace a
+    value baked into the model's endpoint. Preserve the original raw spelling
+    when keys do not overlap; this keeps repeated and valueless base
+    parameters intact while avoiding needless re-encoding.
+    """
+    if not extra_query:
+        return base_query
+    if not base_query:
+        return extra_query
+
+    base_items = list(httpx.QueryParams(base_query).multi_items())
+    extra_items = list(httpx.QueryParams(extra_query).multi_items())
+    extra_keys = {key for key, _ in extra_items}
+    if not any(key in extra_keys for key, _ in base_items):
+        return _join_raw_queries(base_query, extra_query)
+
+    merged_items = [
+        (key, value) for key, value in base_items if key not in extra_keys
+    ]
+    merged_items.extend(extra_items)
+    return str(httpx.QueryParams(merged_items)).encode("ascii")
+
+
 class _OwnedClientStream:
     """An async stream that deterministically closes its owned SDK client."""
 
     def __init__(self, stream: Any, client: Any):
         self._stream = stream
-        self._iterator = stream.__aiter__()
+        self._iterator: Optional[Any] = None
         self._client = client
         self._source_closed = False
         self._client_closed = False
@@ -153,6 +204,8 @@ class _OwnedClientStream:
         if self._closed:
             raise StopAsyncIteration
         try:
+            if self._iterator is None:
+                self._iterator = self._stream.__aiter__()
             return await self._iterator.__anext__()
         except BaseException as exc:
             try:
@@ -165,19 +218,45 @@ class _OwnedClientStream:
                 raise exc from close_exc
             raise
 
+    def _source_aclose(self) -> Optional[Any]:
+        sources = []
+        if self._iterator is not None:
+            sources.append(self._iterator)
+        if self._stream is not self._iterator:
+            sources.append(self._stream)
+
+        for source in sources:
+            close_stream = getattr(source, "aclose", None)
+            if close_stream is not None:
+                return close_stream
+
+        # LiteLLM's Responses fallback iterator owns the real HTTP stream in
+        # this wrapper but does not expose an aclose() method of its own.
+        for source in sources:
+            wrapper = getattr(
+                source, "litellm_custom_stream_wrapper", None
+            )
+            close_stream = getattr(wrapper, "aclose", None)
+            if close_stream is not None:
+                return close_stream
+
+        for source in sources:
+            response = getattr(source, "response", None)
+            close_stream = getattr(response, "aclose", None)
+            if close_stream is not None:
+                return close_stream
+        return None
+
     async def _close_resources(self) -> None:
         source_error: Optional[BaseException] = None
-        close_stream = getattr(self._iterator, "aclose", None)
-        if close_stream is None and self._iterator is not self._stream:
-            close_stream = getattr(self._stream, "aclose", None)
         if not self._source_closed:
             try:
+                close_stream = self._source_aclose()
                 if close_stream is not None:
                     await close_stream()
+                self._source_closed = True
             except BaseException as exc:
                 source_error = exc
-            else:
-                self._source_closed = True
 
         client_error: Optional[BaseException] = None
         if not self._client_closed:
@@ -300,6 +379,8 @@ def _prepare_litellm_base_url(
     base_url: str,
     provider: Optional[str],
     model: str,
+    *,
+    responses: bool = False,
 ) -> str:
     """Prepare provider-specific URL joining without moving query parameters.
 
@@ -307,6 +388,63 @@ def _prepare_litellm_base_url(
     must be the API root. DeepSeek instead appends its endpoint before using
     LiteLLM's HTTP handler. Fragments are dropped because HTTP never sends them.
     """
+    # Azure's Responses transformer owns the ``/openai(/v1)/responses`` route.
+    # Give it an API root, but keep a configured query in the URL itself so its
+    # ``api-version`` detection can prevent the default version being added a
+    # second time.  This branch is deliberately limited to Responses calls;
+    # chat-completions uses Azure's separate deployment URL rules.
+    if responses and provider == "azure":
+        parsed = urlsplit(base_url)
+        path = parsed.path.rstrip("/")
+        for suffix in (
+            "/openai/v1/responses",
+            "/openai/responses",
+            "/responses",
+        ):
+            if path == suffix or path.endswith(suffix):
+                path = path[:-len(suffix)].rstrip("/")
+                break
+        # Azure chat configurations commonly point at a deployment resource
+        # (``/openai/deployments/<name>``). Responses puts the model/deployment
+        # in the request body and always uses the account-level route, so strip
+        # that resource segment before LiteLLM appends ``/openai/responses``.
+        lower_path = path.lower()
+        for marker in ("/openai/v1/deployments/", "/openai/deployments/"):
+            marker_index = lower_path.find(marker)
+            if marker_index < 0:
+                continue
+            deployment = path[marker_index + len(marker):]
+            if deployment and "/" not in deployment:
+                path = path[:marker_index].rstrip("/")
+                break
+        for suffix in ("/openai/v1", "/openai"):
+            if path == suffix or path.endswith(suffix):
+                path = path[:-len(suffix)].rstrip("/")
+                break
+        return urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            path,
+            parsed.query,
+            "",
+        ))
+
+    if responses:
+        # A configured full Responses resource URL is also accepted. The
+        # common API root is needed because LiteLLM appends the resource path.
+        parsed = urlsplit(base_url)
+        path = parsed.path.rstrip("/")
+        if path == f"/{_RESPONSES_PATH}" or path.endswith(
+            f"/{_RESPONSES_PATH}"
+        ):
+            base_url = urlunsplit((
+                parsed.scheme,
+                parsed.netloc,
+                path[:-len(_RESPONSES_PATH)].rstrip("/"),
+                parsed.query,
+                parsed.fragment,
+            ))
+
     if provider == "openai":
         api_root, raw_query = _openai_endpoint_parts(base_url)
         return _OpenAIQueryBaseURL(api_root, raw_query)
@@ -315,7 +453,23 @@ def _prepare_litellm_base_url(
         return _query_safe_provider_base_url(base_url, provider, model)
 
     if provider not in _URL_JOINING_PROVIDERS:
-        return base_url
+        # Native Responses provider configs generally append ``/responses``
+        # with a string operation. Keep their configured query out of the
+        # path and re-attach it in the request hook after that suffix exists.
+        # This also covers OpenAI-compatible/custom providers (for example
+        # OpenRouter) whose config is not known to this wrapper.
+        parsed = urlsplit(base_url)
+        clean_url = urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path.rstrip("/"),
+            "",
+            "",
+        ))
+        raw_query = httpx.URL(base_url).query
+        if raw_query:
+            return _LiteLLMQueryBaseURL(clean_url, raw_query)
+        return clean_url
 
     parsed = urlsplit(base_url)
     if not parsed.query and not parsed.fragment:
@@ -359,9 +513,11 @@ def _default_vertex_base_url(model: str) -> str:
     return get_vertex_base_url(location)
 
 
-def _attach_openai_query_client(params: Dict[str, Any]) -> Optional[Any]:
+def _attach_openai_query_client(
+    params: Dict[str, Any], *, endpoint_key: str = "base_url",
+) -> Optional[Any]:
     """Attach an isolated, owned client for a model-level OpenAI endpoint."""
-    base_url = params.get("base_url")
+    base_url = params.get(endpoint_key)
     if not isinstance(base_url, _OpenAIQueryBaseURL):
         return None
 
@@ -386,14 +542,18 @@ def _attach_openai_query_client(params: Dict[str, Any]) -> Optional[Any]:
             follow_redirects=True,
         )
     client = AsyncOpenAI(**client_kwargs)
-    params["base_url"] = str(base_url)
+    params[endpoint_key] = str(base_url)
     params["client"] = client
     return client
 
 
-def _attach_litellm_query_client(params: Dict[str, Any]) -> Optional[Any]:
+def _attach_litellm_query_client(
+    params: Dict[str, Any],
+    request_hooks: Optional[List[Any]] = None,
+) -> Optional[Any]:
     """Attach LiteLLM's HTTP handler when a provider base carries a query."""
-    base_url = params.get("base_url")
+    endpoint_key = "api_base" if "api_base" in params else "base_url"
+    base_url = params.get(endpoint_key)
     if not isinstance(base_url, _LiteLLMQueryBaseURL):
         return None
 
@@ -405,8 +565,163 @@ def _attach_litellm_query_client(params: Dict[str, Any]) -> Optional[Any]:
     async def append_base_query(request: httpx.Request) -> None:
         _append_base_query(request, raw_query, origin)
 
-    client = AsyncHTTPHandler(event_hooks={"request": [append_base_query]})
-    params["base_url"] = str(base_url)
+    hooks = list(request_hooks or [])
+    hooks.append(append_base_query)
+    client = AsyncHTTPHandler(event_hooks={"request": hooks})
+    params[endpoint_key] = str(base_url)
+    params["client"] = client
+    return client
+
+
+def _attach_responses_query_client(
+    params: Dict[str, Any], *, omit_input: bool = False,
+) -> Optional[Any]:
+    """Attach an isolated Responses client for query or body adaptation."""
+    base_url = params.get("api_base", params.get("base_url"))
+    extra_query = _encode_query_mapping(params.get("extra_query"))
+    request_hooks: List[Any] = []
+
+    # The explicit OpenAI Chat prefix makes LiteLLM bridge Responses through
+    # ``acompletion``. That path expects an AsyncOpenAI client, not LiteLLM's
+    # lower-level AsyncHTTPHandler used by native Responses providers.
+    model = params.get("model")
+    forced_openai_chat = (
+        isinstance(model, str)
+        and model.strip().startswith(
+            _OPENAI_CHAT_COMPLETIONS_RESPONSES_PREFIX
+        )
+    )
+    if forced_openai_chat:
+        # ``_build_kwargs`` supplies the provider default as a plain string
+        # when no model-level ``base_url`` is configured. Normalize that
+        # value here so a request-level query still uses the AsyncOpenAI
+        # client required by LiteLLM's Chat Completions bridge.
+        if extra_query and isinstance(base_url, str) and not isinstance(
+            base_url, _OpenAIQueryBaseURL
+        ):
+            api_root, raw_query = _openai_endpoint_parts(base_url)
+            base_url = _OpenAIQueryBaseURL(api_root, raw_query)
+            params["api_base"] = base_url
+
+    if forced_openai_chat and isinstance(base_url, _OpenAIQueryBaseURL):
+        params["api_base"] = _OpenAIQueryBaseURL(
+            str(base_url),
+            _merge_query_params(base_url.raw_query, extra_query),
+        )
+        if extra_query:
+            params.pop("extra_query", None)
+        return _attach_openai_query_client(
+            params, endpoint_key="api_base",
+        )
+
+    if omit_input:
+        async def remove_placeholder_input(request: httpx.Request) -> None:
+            """Remove the LiteLLM-only input placeholder from the wire body."""
+            try:
+                payload = json.loads(request.content)
+            except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "could not preserve omitted Responses input"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ValueError("could not preserve omitted Responses input")
+            payload.pop("input", None)
+            content = json.dumps(
+                payload, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")
+            # HTTPX event hooks run after request construction, so replace both
+            # the replayable stream and cached body before the transport sends.
+            request.stream = httpx.ByteStream(content)
+            request._content = content
+            request.headers["content-length"] = str(len(content))
+            request.headers.pop("transfer-encoding", None)
+
+        request_hooks.append(remove_placeholder_input)
+
+    # Azure parses ``api_base`` itself and uses its query to decide whether to
+    # add the default ``api-version``.  Applying a configured query later in an
+    # HTTP hook makes Azure append its default first, yielding duplicate
+    # ``api-version`` values.  Merge the query into ``api_base`` before
+    # LiteLLM builds the route so its normal de-duplication can run.
+    provider = params.get("custom_llm_provider")
+    if isinstance(provider, str) and provider.lower() == "azure":
+        if isinstance(base_url, _LiteLLMQueryBaseURL):
+            parsed = httpx.URL(str(base_url))
+            base_query = base_url.raw_query
+        else:
+            parsed = httpx.URL(str(base_url))
+            base_query = parsed.query
+        merged_query = _merge_query_params(base_query, extra_query)
+        if merged_query:
+            params["api_base"] = str(parsed.copy_with(params=merged_query))
+            # The query has been folded into api_base. Leaving it in the
+            # LiteLLM kwargs would allow a future transformer to append it a
+            # second time.
+            if extra_query:
+                params.pop("extra_query", None)
+            # LiteLLM's Azure transformer uses the explicit ``api_version``
+            # argument to choose between ``/openai/responses`` and
+            # ``/openai/v1/responses``. Derive it from the URL query so a
+            # dated configured version is not silently treated as ``preview``.
+            if "api_version" not in params:
+                query_params = httpx.QueryParams(merged_query)
+                api_version = None
+                for key, value in query_params.multi_items():
+                    if key == "api-version":
+                        api_version = value
+                        break
+                if api_version:
+                    params["api_version"] = api_version
+        elif isinstance(base_url, _LiteLLMQueryBaseURL):
+            params["api_base"] = str(parsed)
+        if request_hooks:
+            from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+            client = AsyncHTTPHandler(
+                event_hooks={"request": request_hooks},
+            )
+            params["client"] = client
+            return client
+        return None
+
+    if not isinstance(base_url, _OpenAIQueryBaseURL):
+        if isinstance(base_url, _LiteLLMQueryBaseURL):
+            if extra_query:
+                params["api_base"] = _LiteLLMQueryBaseURL(
+                    str(base_url),
+                    _merge_query_params(base_url.raw_query, extra_query),
+                )
+        elif extra_query:
+            parsed = urlsplit(str(base_url))
+            clean_url = urlunsplit(
+                (parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")
+            )
+            params["api_base"] = _LiteLLMQueryBaseURL(
+                clean_url,
+                _merge_query_params(
+                    httpx.URL(str(base_url)).query, extra_query,
+                ),
+            )
+        client = _attach_litellm_query_client(params, request_hooks)
+        if client is not None or not request_hooks:
+            return client
+        from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+        client = AsyncHTTPHandler(event_hooks={"request": request_hooks})
+        params["client"] = client
+        return client
+
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+    raw_query = _merge_query_params(base_url.raw_query, extra_query)
+    origin = _url_origin(str(base_url))
+
+    async def append_base_query(request: httpx.Request) -> None:
+        _append_base_query(request, raw_query, origin)
+
+    request_hooks.append(append_base_query)
+    client = AsyncHTTPHandler(event_hooks={"request": request_hooks})
+    params["api_base"] = str(base_url)
     params["client"] = client
     return client
 
@@ -456,6 +771,7 @@ def _build_kwargs(
     stream_options: Optional[Any] = None,
     reasoning_effort: Optional[str] = None,
     thinking_budget: Optional[int] = None,
+    responses: bool = False,
 ) -> Dict[str, Any]:
     if api_key is not None and not isinstance(api_key, str):
         raise ValueError("api_key must be a string or null")
@@ -476,7 +792,10 @@ def _build_kwargs(
     )
     if base_url is not None:
         base_url = _prepare_litellm_base_url(
-            base_url, provider_for_auth, routed_model
+            base_url,
+            provider_for_auth,
+            routed_model,
+            responses=responses,
         )
     elif provider_for_auth == "vertex_ai":
         base_url = _default_vertex_base_url(routed_model)
@@ -543,6 +862,620 @@ def _build_kwargs(
     if thinking_budget is not None:
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
     return kwargs
+
+
+_RESPONSES_OPTIONAL_PARAMS = (
+    "include",
+    "instructions",
+    "prompt",
+    "metadata",
+    "conversation",
+    "parallel_tool_calls",
+    "previous_response_id",
+    "reasoning",
+    "store",
+    "background",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tools",
+    "top_p",
+    "truncation",
+    "user",
+    "service_tier",
+    "safety_identifier",
+    "stream_options",
+    "top_logprobs",
+    "max_tool_calls",
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "prompt_cache_retention",
+    "context_management",
+    "moderation",
+    "partial_images",
+    "thinking",
+    "text_format",
+)
+
+_RESPONSES_REQUEST_FIELDS = frozenset(_RESPONSES_OPTIONAL_PARAMS) | frozenset({
+    "allowed_openai_params",
+    "extra_body",
+    "extra_headers",
+    "extra_query",
+    "input",
+    "max_output_tokens",
+    "max_tokens",
+    "model",
+    "response_format",
+    "stream",
+    "timeout",
+})
+
+# LiteLLM 1.98 accepts these names at the Python boundary but does not yet
+# include all of them in ``ResponsesAPIOptionalRequestParams``. Keep the
+# direct kwargs for newer LiteLLM versions and also place them in
+# ``extra_body`` so the current native HTTP handler does not silently drop
+# them.
+_RESPONSES_COMPAT_EXTRA_BODY_PARAMS = frozenset({
+    "conversation",
+    "moderation",
+    "partial_images",
+    "prompt_cache_options",
+    "thinking",
+})
+
+# LiteLLM's Responses-to-Chat bridge accepts these fields at its public
+# boundary but cannot preserve their Responses semantics. Harmless default
+# values are allowed below; meaningful values must fail before any HTTP call.
+_RESPONSES_FALLBACK_UNSUPPORTED_PARAMS = frozenset({
+    "conversation",
+    "context_management",
+    "include",
+    "max_tool_calls",
+    "metadata",
+    "moderation",
+    "partial_images",
+    "prompt",
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "prompt_cache_retention",
+    "safety_identifier",
+    "service_tier",
+    "stream_options",
+    "top_logprobs",
+})
+
+# These are the only Responses tools that LiteLLM's Chat Completions bridge
+# deterministically converts and converts back. Built-in, namespace, and future
+# tool types are provider-dependent, emulated, flattened, silently dropped, or
+# passed through in a non-Chat shape, so reject them before starting a stream.
+_RESPONSES_FALLBACK_SUPPORTED_TOOL_TYPES = frozenset({
+    "custom",
+    "function",
+})
+
+_RESPONSES_FALLBACK_SUPPORTED_INPUT_TYPES = frozenset({
+    "message",
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+})
+
+_RESPONSES_FALLBACK_RICH_TOOL_OUTPUT_TYPES = frozenset({
+    "input_file",
+    "input_image",
+})
+
+_RESPONSES_PROTECTED_HEADERS = frozenset({
+    "authorization",
+    "api-key",
+    "x-api-key",
+    "x-goog-api-key",
+    "proxy-authorization",
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "cookie",
+})
+
+# ``extra_body`` is merged into the provider payload after LiteLLM has built the
+# request. Standard fields must stay owned by this wrapper so extensions cannot
+# override routing or bypass native/fallback validation.
+_RESPONSES_PROTECTED_EXTRA_BODY_KEYS = _RESPONSES_REQUEST_FIELDS | frozenset({
+    "messages",
+    "api_key",
+    "api_base",
+    "base_url",
+    "custom_llm_provider",
+    "client",
+})
+
+
+def _responses_provider_uses_chat_fallback(
+    model: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Return whether LiteLLM will bridge Responses through Chat Completions."""
+    from litellm.utils import ProviderConfigManager
+
+    resolved_provider = resolve_model_provider(model, provider, base_url)
+    routed_model, custom_llm_provider = resolve_litellm_route(
+        model, provider, base_url,
+    )
+    provider_name = custom_llm_provider or resolved_provider
+    # LiteLLM treats this model prefix as an explicit request to route the
+    # Responses API through its Chat Completions bridge, even though OpenAI
+    # otherwise has a native Responses provider config.
+    forced_openai_chat = (
+        isinstance(model, str)
+        and model.strip().startswith(
+            _OPENAI_CHAT_COMPLETIONS_RESPONSES_PREFIX
+        )
+        and provider_name == "openai"
+    )
+    if forced_openai_chat:
+        return True, provider_name
+    native_config = ProviderConfigManager.get_provider_responses_api_config(
+        provider=provider_name,
+        model=routed_model,
+    )
+    return native_config is None, provider_name
+
+
+def _validate_responses_fallback_params(
+    params: Dict[str, Any], provider: str, *, input_omitted: bool = False,
+) -> None:
+    """Reject Responses semantics the Chat Completions bridge cannot honor."""
+    unsupported = {
+        key
+        for key in _RESPONSES_FALLBACK_UNSUPPORTED_PARAMS
+        if params.get(key) not in (None, False, "", [], {})
+    }
+    if params.get("previous_response_id") is not None:
+        unsupported.add("previous_response_id")
+    if params.get("store") is True:
+        unsupported.add("store")
+    if params.get("background") is True:
+        unsupported.add("background")
+    if params.get("truncation") not in (None, "disabled"):
+        unsupported.add("truncation")
+    if input_omitted:
+        unsupported.add("input (omitted)")
+
+    unsupported_input_types = set()
+    unsupported_features = set()
+
+    def find_lossy_content(value: Any) -> None:
+        if isinstance(value, (list, tuple)):
+            for child in value:
+                find_lossy_content(child)
+            return
+        if not isinstance(value, dict):
+            return
+        value_type = value.get("type")
+        if (
+            value_type == "input_image"
+            and value.get("file_id") not in (None, False, "", [], {})
+        ):
+            unsupported_features.add("input_image.file_id")
+        if value_type in {"input_text", "input_image", "input_file"} and (
+            "prompt_cache_breakpoint" in value
+            and value["prompt_cache_breakpoint"] is not None
+        ):
+            unsupported_features.add(
+                f"{value_type}.prompt_cache_breakpoint"
+            )
+        if value_type == "input_file":
+            for field in ("filename", "detail"):
+                if field in value and value[field] is not None:
+                    unsupported_features.add(f"input_file.{field}")
+        if value_type in {
+            "function_call_output", "custom_tool_call_output",
+        }:
+            output = value.get("output")
+            if isinstance(output, (list, tuple)):
+                for part in output:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type")
+                    if part_type in _RESPONSES_FALLBACK_RICH_TOOL_OUTPUT_TYPES:
+                        unsupported_features.add(
+                            f"{value_type}.output.{part_type}"
+                        )
+        for nested_key in ("content", "output"):
+            if nested_key in value:
+                find_lossy_content(value[nested_key])
+
+    response_input = params.get("input")
+    if isinstance(response_input, list):
+        for item in response_input:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type") or "message"
+            if (
+                not isinstance(item_type, str)
+                or item_type not in _RESPONSES_FALLBACK_SUPPORTED_INPUT_TYPES
+            ):
+                unsupported_input_types.add(str(item_type))
+            if item_type == "message" and item.get("phase") is not None:
+                unsupported_features.add("message.phase")
+            find_lossy_content(item)
+
+    text = params.get("text")
+    if isinstance(text, dict):
+        for key, value in text.items():
+            if key != "format" and value not in (None, False, "", [], {}):
+                unsupported_features.add(f"text.{key}")
+
+    reasoning = params.get("reasoning")
+    if isinstance(reasoning, dict):
+        for key, value in reasoning.items():
+            if key != "effort" and value not in (None, False, "", [], {}):
+                unsupported_features.add(f"reasoning.{key}")
+
+    tool_choice = params.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type")
+        supported_choice_types = {
+            "auto", "none", "required", "tool", "any", "function", "custom",
+        }
+        if (
+            not isinstance(choice_type, str)
+            or choice_type not in supported_choice_types
+        ):
+            choice_label = (
+                choice_type
+                if isinstance(choice_type, str) and choice_type
+                else "object"
+            )
+            unsupported_features.add(
+                f"tool_choice.{choice_label}"
+            )
+
+    unsupported_tools = set()
+    tools = params.get("tools")
+    if isinstance(tools, (list, tuple)):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                unsupported_tools.add("invalid")
+                continue
+            tool_type = tool.get("type")
+            if (
+                not isinstance(tool_type, str)
+                or tool_type not in _RESPONSES_FALLBACK_SUPPORTED_TOOL_TYPES
+            ):
+                unsupported_tools.add(
+                    tool_type
+                    if isinstance(tool_type, str) and tool_type
+                    else "invalid"
+                )
+                continue
+            if tool_type == "function" and "output_schema" in tool:
+                unsupported_features.add("function.output_schema")
+            if (
+                tool_type == "custom"
+                and tool.get("defer_loading") not in (None, False)
+            ):
+                unsupported_features.add("custom.defer_loading")
+    elif tools is not None:
+        unsupported_features.add("tools (must be an array)")
+
+    if (
+        not unsupported
+        and not unsupported_tools
+        and not unsupported_input_types
+        and not unsupported_features
+    ):
+        return
+
+    details = []
+    if unsupported:
+        details.append("parameter(s): " + ", ".join(sorted(unsupported)))
+    if unsupported_tools:
+        details.append(
+            "tool type(s): " + ", ".join(sorted(unsupported_tools))
+        )
+    if unsupported_input_types:
+        details.append(
+            "input item type(s): "
+            + ", ".join(sorted(unsupported_input_types))
+        )
+    if unsupported_features:
+        details.append(
+            "feature(s): " + ", ".join(sorted(unsupported_features))
+        )
+    raise ValueError(
+        f"Responses {'; '.join(details)} are not supported for provider "
+        f"{provider!r} because LiteLLM uses its Chat Completions fallback"
+    )
+
+
+def _validate_responses_extras(
+    extra_headers: Optional[Dict[str, Any]],
+    extra_query: Optional[Dict[str, Any]],
+    timeout: Any,
+    allowed_openai_params: Optional[List[str]],
+) -> None:
+    if extra_headers is not None:
+        if not isinstance(extra_headers, dict):
+            raise ValueError("extra_headers must be an object or null")
+        if any(not isinstance(key, str) or not key.strip() for key in extra_headers):
+            raise ValueError("extra_headers keys must be non-empty strings")
+        if any(not isinstance(value, str) for value in extra_headers.values()):
+            raise ValueError("extra_headers values must be strings")
+        protected = sorted(
+            key for key in extra_headers
+            if key.lower() in _RESPONSES_PROTECTED_HEADERS
+        )
+        if protected:
+            raise ValueError(
+                "extra_headers cannot override protected header(s): "
+                + ", ".join(protected)
+            )
+
+    if extra_query is not None:
+        if not isinstance(extra_query, dict):
+            raise ValueError("extra_query must be an object or null")
+        if any(not isinstance(key, str) or not key.strip() for key in extra_query):
+            raise ValueError("extra_query keys must be non-empty strings")
+
+    if timeout is not None:
+        if isinstance(timeout, bool):
+            raise ValueError("timeout must be a positive number or httpx.Timeout")
+        if isinstance(timeout, Real):
+            if not math.isfinite(float(timeout)) or timeout <= 0:
+                raise ValueError("timeout must be a positive number")
+        elif not isinstance(timeout, httpx.Timeout):
+            raise ValueError("timeout must be a positive number or httpx.Timeout")
+
+    if allowed_openai_params is not None:
+        if not isinstance(allowed_openai_params, (list, tuple)):
+            raise ValueError("allowed_openai_params must be an array or null")
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in allowed_openai_params
+        ):
+            raise ValueError("allowed_openai_params must contain strings")
+
+
+def _validate_responses_background(background: Any) -> None:
+    if background is not None and not isinstance(background, bool):
+        raise ValueError("background must be a boolean or null")
+    if background is True:
+        raise ValueError(
+            "background=true is not supported because Responses retrieval "
+            "endpoints are not implemented"
+        )
+
+
+def _validate_responses_request(body: Any) -> None:
+    """Validate request-shape fields before a Responses request starts.
+
+    LiteLLM validates these values only when it is called. The proxy needs the
+    same checks before constructing a streaming response so malformed client
+    requests can still receive an HTTP 400 status.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("Invalid JSON: request body must be an object")
+    unknown = sorted(
+        str(key) for key in body if key not in _RESPONSES_REQUEST_FIELDS
+    )
+    if unknown:
+        raise ValueError(
+            "unsupported Responses parameter(s): " + ", ".join(unknown)
+        )
+    # OpenAI's Responses API allows callers to omit ``input`` (for example
+    # when continuing a conversation by ``previous_response_id``).  Validate
+    # its shape only when the field is present.
+    if "input" in body and not isinstance(body["input"], (str, list)):
+        raise ValueError("input must be a string or array")
+    if isinstance(body.get("input"), list) and any(
+        not isinstance(item, dict) for item in body["input"]
+    ):
+        raise ValueError("input array items must be objects")
+    if "stream" in body and not isinstance(body["stream"], bool):
+        raise ValueError("stream must be a boolean")
+    _validate_responses_background(body.get("background"))
+
+    extra_body = body.get("extra_body")
+    if extra_body is not None and not isinstance(extra_body, dict):
+        raise ValueError("extra_body must be an object or null")
+    if extra_body:
+        protected = sorted(
+            str(key) for key in extra_body
+            if isinstance(key, str)
+            and key.lower() in _RESPONSES_PROTECTED_EXTRA_BODY_KEYS
+        )
+        if protected:
+            raise ValueError(
+                "extra_body cannot override protected field(s): "
+                + ", ".join(protected)
+            )
+
+    _validate_responses_extras(
+        body.get("extra_headers"),
+        body.get("extra_query"),
+        body.get("timeout"),
+        body.get("allowed_openai_params"),
+    )
+
+
+def _responses_text_from_response_format(response_format: Any) -> Any:
+    """Translate Chat Completions structured-output formats to Responses.
+
+    Chat Completions nests JSON schema metadata under ``json_schema`` while
+    Responses expects ``name``, ``schema`` and ``strict`` directly under
+    ``text.format``. Native Responses ``{"format": ...}`` values are kept
+    unchanged so callers can use either request shape.
+    """
+    if not isinstance(response_format, dict):
+        return {"format": response_format}
+
+    if "format" in response_format:
+        return response_format
+
+    if response_format.get("type") != "json_schema":
+        return {"format": response_format}
+
+    json_schema = response_format.get("json_schema")
+    if not isinstance(json_schema, dict):
+        return {"format": response_format}
+
+    format_value = {
+        "type": "json_schema",
+        "name": json_schema.get("name", "response_schema"),
+        "schema": json_schema.get("schema", {}),
+        "strict": json_schema.get("strict", False),
+    }
+    return {"format": format_value}
+
+
+def _build_responses_kwargs(
+    model: str,
+    input: Any = _MISSING_RESPONSES_INPUT,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    provider: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
+    thinking_budget: Optional[int] = None,
+    stream: Optional[bool] = None,
+    extra_body: Optional[Dict[str, Any]] = None,
+    text_format: Any = None,
+    extra_headers: Optional[Dict[str, Any]] = None,
+    extra_query: Optional[Dict[str, Any]] = None,
+    timeout: Any = None,
+    allowed_openai_params: Optional[List[str]] = None,
+    response_format: Any = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    if extra_body is not None and not isinstance(extra_body, dict):
+        raise ValueError("extra_body must be an object or null")
+    if extra_body:
+        protected = sorted(
+            str(key) for key in extra_body
+            if isinstance(key, str)
+            and key.lower() in _RESPONSES_PROTECTED_EXTRA_BODY_KEYS
+        )
+        if protected:
+            raise ValueError(
+                "extra_body cannot override protected field(s): "
+                + ", ".join(protected)
+            )
+
+    _validate_responses_extras(
+        extra_headers,
+        extra_query,
+        timeout,
+        allowed_openai_params,
+    )
+
+    unknown = sorted(set(kwargs) - set(_RESPONSES_OPTIONAL_PARAMS))
+    if unknown:
+        raise ValueError(
+            "unsupported Responses parameter(s): " + ", ".join(unknown)
+        )
+    _validate_responses_background(kwargs.get("background"))
+
+    uses_chat_fallback, resolved_provider = (
+        _responses_provider_uses_chat_fallback(model, provider, base_url)
+    )
+
+    routing = _build_kwargs(
+        model=model,
+        messages=[],
+        api_key=api_key,
+        base_url=base_url,
+        provider=provider,
+        responses=True,
+    )
+    routing.pop("messages")
+    forced_openai_chat = (
+        isinstance(model, str)
+        and model.strip().startswith(
+            _OPENAI_CHAT_COMPLETIONS_RESPONSES_PREFIX
+        )
+        and resolved_provider == "openai"
+    )
+    if forced_openai_chat:
+        # An explicit provider normally strips the recognized ``openai/``
+        # prefix. Keep LiteLLM's complete opt-in prefix intact so it still
+        # selects the Chat Completions bridge.
+        routing["model"] = model.strip()
+        routing.pop("custom_llm_provider", None)
+    # LiteLLM's Responses API accepts the endpoint as ``api_base``. Its
+    # Chat Completions wrapper accepts ``base_url``, but Responses silently
+    # falls back to the provider default when that alias is left in kwargs.
+    if "base_url" in routing:
+        routing["api_base"] = routing.pop("base_url")
+    input_omitted = input is _MISSING_RESPONSES_INPUT
+    # LiteLLM 1.98 requires ``input`` in its Python signature even though the
+    # Responses API makes it optional. Native calls use a temporary placeholder
+    # that the owned request hook removes before the HTTP request is sent.
+    params: Dict[str, Any] = {
+        **routing,
+        "input": "" if input_omitted else input,
+    }
+
+    output_limit = max_output_tokens if max_output_tokens is not None else max_tokens
+    if output_limit is not None:
+        params["max_output_tokens"] = output_limit
+    if reasoning_effort is not None and kwargs.get("reasoning") is None:
+        params["reasoning"] = {"effort": reasoning_effort}
+    compat_extra_body: Dict[str, Any] = {}
+    if thinking_budget is not None:
+        thinking = {
+            "type": "enabled",
+            "budget_tokens": thinking_budget,
+        }
+        params["thinking"] = thinking
+        if not uses_chat_fallback:
+            compat_extra_body["thinking"] = thinking
+    if stream is not None:
+        params["stream"] = stream
+
+    if text_format is not None:
+        params["text_format"] = text_format
+    if (
+        response_format is not None
+        and text_format is None
+        and kwargs.get("text") is None
+    ):
+        # Compatibility with clients that reuse Chat Completions' structured
+        # output field when switching to the Responses endpoint.
+        params["text"] = _responses_text_from_response_format(response_format)
+    if extra_headers is not None:
+        params["extra_headers"] = extra_headers
+    if extra_query is not None:
+        params["extra_query"] = extra_query
+    if timeout is not None:
+        params["timeout"] = timeout
+    if allowed_openai_params is not None:
+        params["allowed_openai_params"] = list(allowed_openai_params)
+
+    for key in _RESPONSES_OPTIONAL_PARAMS:
+        value = kwargs.get(key)
+        if value is not None:
+            params[key] = value
+            if (
+                not uses_chat_fallback
+                and key in _RESPONSES_COMPAT_EXTRA_BODY_PARAMS
+            ):
+                compat_extra_body[key] = value
+
+    if uses_chat_fallback:
+        _validate_responses_fallback_params(
+            params, resolved_provider, input_omitted=input_omitted,
+        )
+
+    if extra_body:
+        compat_extra_body = {**compat_extra_body, **extra_body}
+    if compat_extra_body:
+        params["extra_body"] = compat_extra_body
+    return params
 
 
 async def llm_completion(
@@ -667,6 +1600,128 @@ async def llm_stream_completion(
         client = _attach_litellm_query_client(params)
     try:
         stream = await litellm.acompletion(**params)
+    except BaseException as exc:
+        if client is not None:
+            await _close_client_after_error(client, exc)
+        raise
+    if client is None:
+        return stream
+    return _OwnedClientStream(stream, client)
+
+
+async def llm_response(
+    model: str,
+    input: Any = _MISSING_RESPONSES_INPUT,
+    api_key: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
+    thinking_budget: Optional[int] = None,
+    base_url: Optional[str] = None,
+    provider: Optional[str] = None,
+    *,
+    stream: Optional[bool] = None,
+    extra_body: Optional[Dict[str, Any]] = None,
+    text_format: Any = None,
+    extra_headers: Optional[Dict[str, Any]] = None,
+    extra_query: Optional[Dict[str, Any]] = None,
+    timeout: Any = None,
+    allowed_openai_params: Optional[List[str]] = None,
+    response_format: Any = None,
+    **kwargs: Any,
+) -> dict:
+    """Non-streaming Responses API call through LiteLLM."""
+    if stream is not None:
+        raise ValueError(
+            "stream cannot be passed through llm_response; use "
+            "llm_stream_response explicitly"
+        )
+    params = _build_responses_kwargs(
+        model=model,
+        input=input,
+        api_key=api_key,
+        base_url=base_url,
+        provider=provider,
+        max_output_tokens=max_output_tokens,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        thinking_budget=thinking_budget,
+        extra_body=extra_body,
+        text_format=text_format,
+        extra_headers=extra_headers,
+        extra_query=extra_query,
+        timeout=timeout,
+        allowed_openai_params=allowed_openai_params,
+        response_format=response_format,
+        **kwargs,
+    )
+    client = _attach_responses_query_client(
+        params, omit_input=input is _MISSING_RESPONSES_INPUT,
+    )
+    try:
+        response = await litellm.aresponses(**params)
+        result = response.model_dump() if hasattr(response, "model_dump") else response
+    except BaseException as exc:
+        if client is not None:
+            await _close_client_after_error(client, exc)
+        raise
+    if client is not None:
+        await _close_client(client)
+    return result
+
+
+async def llm_stream_response(
+    model: str,
+    input: Any = _MISSING_RESPONSES_INPUT,
+    api_key: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
+    thinking_budget: Optional[int] = None,
+    base_url: Optional[str] = None,
+    provider: Optional[str] = None,
+    *,
+    stream: Optional[bool] = None,
+    extra_body: Optional[Dict[str, Any]] = None,
+    text_format: Any = None,
+    extra_headers: Optional[Dict[str, Any]] = None,
+    extra_query: Optional[Dict[str, Any]] = None,
+    timeout: Any = None,
+    allowed_openai_params: Optional[List[str]] = None,
+    response_format: Any = None,
+    **kwargs: Any,
+) -> Any:
+    """Streaming Responses API call through LiteLLM."""
+    if stream is not None:
+        raise ValueError(
+            "stream cannot be passed through llm_stream_response; use "
+            "llm_response explicitly for non-streaming calls"
+        )
+    params = _build_responses_kwargs(
+        model=model,
+        input=input,
+        api_key=api_key,
+        base_url=base_url,
+        provider=provider,
+        max_output_tokens=max_output_tokens,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        thinking_budget=thinking_budget,
+        stream=True,
+        extra_body=extra_body,
+        text_format=text_format,
+        extra_headers=extra_headers,
+        extra_query=extra_query,
+        timeout=timeout,
+        allowed_openai_params=allowed_openai_params,
+        response_format=response_format,
+        **kwargs,
+    )
+    client = _attach_responses_query_client(
+        params, omit_input=input is _MISSING_RESPONSES_INPUT,
+    )
+    try:
+        stream = await litellm.aresponses(**params)
     except BaseException as exc:
         if client is not None:
             await _close_client_after_error(client, exc)

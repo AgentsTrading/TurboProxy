@@ -16,7 +16,12 @@ from .config import (
 from .verifier_client import build_verifier_client, verifier_model_id
 from .conversion import AnthropicToOpenAI, OpenAIToAnthropic, STOP_REASON_MAP
 from .sse import SSEFormatter
-from .llm import llm_completion, llm_stream_completion
+from .llm import (
+    llm_completion,
+    llm_stream_completion,
+    llm_response,
+    llm_stream_response,
+)
 from .request_log import create_request_log, save_request_log
 
 __all__ = [
@@ -39,6 +44,8 @@ __all__ = [
     "SSEFormatter",
     "llm_completion",
     "llm_stream_completion",
+    "llm_response",
+    "llm_stream_response",
     "create_request_log",
     "save_request_log",
 ]

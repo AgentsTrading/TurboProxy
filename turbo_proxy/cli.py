@@ -26,7 +26,10 @@ def main() -> None:
     logger.info(f"Listening on http://localhost:{args.port}")
     logger.info(f"Backend model: {server.backend.model_name}")
     logger.info("Anthropic: POST /v1/messages")
-    logger.info("OpenAI:    POST /v1/chat/completions | GET /v1/models")
+    logger.info(
+        "OpenAI:    POST /v1/chat/completions | POST /v1/responses | "
+        "GET /v1/models"
+    )
     logger.info(f"Visualizer: http://localhost:{args.port}/visualizer")
 
     uvicorn.run(

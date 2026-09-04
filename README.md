@@ -30,6 +30,14 @@ Or from source:
 pip install -e .
 ```
 
+For development and debugging, run the current checkout directly with
+[`uv`](https://docs.astral.sh/uv/) instead of installing the package:
+
+```bash
+uv run python -m turbo_proxy          # first run, sync dependencies
+uv run --no-sync python -m turbo_proxy # subsequent runs
+```
+
 ## Setup
 
 For Turbo Proxy to work, you need a `turbo-proxy.yaml`. You can copy the reference file in this repo.

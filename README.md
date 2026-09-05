@@ -246,13 +246,34 @@ verifier:
     api_key: $OPENAI_API_KEY
 ```
 
+### Responses API provider support
+
+`POST /v1/responses` is native-only. Turbo Proxy checks the installed LiteLLM
+provider configuration before sending a request and never converts a Responses
+request into Chat Completions. A provider or model without a native Responses
+implementation is rejected with HTTP 400; use `/v1/chat/completions` or
+`/v1/messages` for chat-only providers instead.
+
+When the verifier is enabled, this check is applied to every candidate before
+any upstream request starts. A verifier fan-out containing both native and
+non-native Responses candidates is rejected as a whole. The native provider
+set is determined by the installed LiteLLM version and can change as LiteLLM
+adds support. In the current setup, OpenAI and Azure native Responses models
+are supported, while examples such as `anthropic/`, `gemini/`,
+`deepseek/`, and the explicit `openai/chat_completions/` route are chat-only
+for this endpoint.
+
+This restriction applies to candidate generation only. The verifier itself
+continues to use its token-logprob clients (Vertex AI Gemini, DeepSeek, or an
+OpenAI-compatible vLLM/SGLang endpoint) and does not call the Responses API.
+
 ## API endpoints
 
 | Endpoint | Format |
 |----------|--------|
 | `POST /v1/messages` | Anthropic |
 | `POST /v1/chat/completions` | OpenAI |
-| `POST /v1/responses` | OpenAI Responses |
+| `POST /v1/responses` | OpenAI Responses (native providers only) |
 | `GET /v1/models` | OpenAI |
 | `GET /visualizer` | Pipeline visualizer UI |
 | `*` | Upstream passthrough to api.anthropic.com |

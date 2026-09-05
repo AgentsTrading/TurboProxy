@@ -8,6 +8,9 @@ backend:
       temperature: 1
       thinking: high           # none, low, medium, high, or a token budget
       max_tokens: 65536
+      # /v1/responses requires a native Responses provider. It never falls
+      # back to /chat/completions; use /v1/chat/completions or /v1/messages
+      # for chat-only backend providers.
 
 verifier:
   model:
@@ -30,6 +33,11 @@ verifier:
     # A bare model name plus base_url defaults to the OpenAI-compatible path.
     # Use deepseek/ with base_url only for a transparent DeepSeek API proxy;
     # a vLLM/SGLang server hosting DeepSeek weights stays OpenAI-compatible.
+
+    # The verifier model is separate from Responses candidate generation and
+    # does not need to implement the Responses API. If /v1/responses is used,
+    # every configured candidate must be native; mixed native/chat-only
+    # candidates are rejected before any upstream request.
 
   majority_voting: true        # skip the tournament when a majority of candidates agree
 

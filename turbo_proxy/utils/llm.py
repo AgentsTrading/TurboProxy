@@ -92,6 +92,7 @@ _RESPONSES_PATH = "responses"
 _OPENAI_CHAT_COMPLETIONS_RESPONSES_PREFIX = "openai/chat_completions/"
 _URL_JOINING_PROVIDERS = {"deepseek"}
 _QUERY_CLIENT_PROVIDERS = {"anthropic", "gemini", "vertex_ai"}
+_AZURE_V1_API_VERSIONS = frozenset({"latest", "preview", "v1"})
 _PROVIDER_DEFAULT_BASE_URLS = {
     "openai": "https://api.openai.com/v1",
     "deepseek": "https://api.deepseek.com/beta",
@@ -230,8 +231,8 @@ class _OwnedClientStream:
             if close_stream is not None:
                 return close_stream
 
-        # LiteLLM's Responses fallback iterator owns the real HTTP stream in
-        # this wrapper but does not expose an aclose() method of its own.
+        # Some LiteLLM stream iterators own the real HTTP stream in this
+        # wrapper but do not expose an aclose() method of their own.
         for source in sources:
             wrapper = getattr(
                 source, "litellm_custom_stream_wrapper", None
@@ -396,6 +397,12 @@ def _prepare_litellm_base_url(
     if responses and provider == "azure":
         parsed = urlsplit(base_url)
         path = parsed.path.rstrip("/")
+        chat_suffix = f"/{_CHAT_COMPLETIONS_PATH}"
+        if path == chat_suffix or path.endswith(chat_suffix):
+            # A Chat Completions resource URL can also be supplied for a
+            # Responses request. Strip it before looking for deployments;
+            # otherwise the endpoint becomes part of the deployment name.
+            path = path[:-len(chat_suffix)].rstrip("/")
         for suffix in (
             "/openai/v1/responses",
             "/openai/responses",
@@ -428,6 +435,24 @@ def _prepare_litellm_base_url(
             parsed.query,
             "",
         ))
+
+    if provider == "azure":
+        parsed = urlsplit(base_url)
+        path = parsed.path.rstrip("/")
+        chat_suffix = f"/{_CHAT_COMPLETIONS_PATH}"
+        if path == chat_suffix or path.endswith(chat_suffix):
+            path = path[:-len(chat_suffix)].rstrip("/")
+        clean_url = urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            path,
+            "",
+            "",
+        ))
+        raw_query = httpx.URL(base_url).query
+        if raw_query:
+            return _LiteLLMQueryBaseURL(clean_url, raw_query)
+        return clean_url
 
     if responses:
         # A configured full Responses resource URL is also accepted. The
@@ -547,15 +572,161 @@ def _attach_openai_query_client(
     return client
 
 
-def _attach_litellm_query_client(
+def _model_scoped_azure_headers(api_key: str) -> Dict[str, Any]:
+    """Keep process-wide OpenAI headers off a model-level Azure client."""
+    from openai import omit
+
+    headers: Dict[str, Any] = {
+        "Authorization": omit,
+        "OpenAI-Organization": omit,
+        "OpenAI-Project": omit,
+    }
+    custom_headers = os.environ.get("OPENAI_CUSTOM_HEADERS")
+    if custom_headers is not None:
+        for line in custom_headers.split("\n"):
+            colon = line.find(":")
+            if colon >= 0 and (name := line[:colon].strip()):
+                headers[name] = omit
+    headers["api-key"] = api_key
+    return headers
+
+
+def _attach_azure_query_client(
     params: Dict[str, Any],
     request_hooks: Optional[List[Any]] = None,
 ) -> Optional[Any]:
-    """Attach LiteLLM's HTTP handler when a provider base carries a query."""
+    """Attach an OpenAI SDK client for a model-level Azure endpoint query."""
     endpoint_key = "api_base" if "api_base" in params else "base_url"
     base_url = params.get(endpoint_key)
     if not isinstance(base_url, _LiteLLMQueryBaseURL):
         return None
+
+    from openai import AsyncAzureOpenAI, AsyncOpenAI, DefaultAsyncHttpxClient
+
+    raw_query = base_url.raw_query
+    parsed = urlsplit(str(base_url))
+    path = parsed.path.rstrip("/")
+    clean_url = urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        path,
+        "",
+        "",
+    ))
+    query_params = httpx.QueryParams(raw_query)
+    api_version = params.get("api_version")
+    if not isinstance(api_version, str) or not api_version:
+        for key, value in query_params.multi_items():
+            if key == "api-version":
+                api_version = value
+                break
+    if not isinstance(api_version, str) or not api_version:
+        api_version = os.environ.get("AZURE_API_VERSION")
+    if not isinstance(api_version, str) or not api_version:
+        api_version = getattr(
+            litellm, "AZURE_DEFAULT_API_VERSION", "2025-02-01-preview"
+        )
+
+    origin = _url_origin(clean_url)
+    hooks = list(request_hooks or [])
+
+    async def merge_base_query(request: httpx.Request) -> None:
+        if _url_origin(request.url) != origin:
+            return
+        current_url = httpx.URL(request.url)
+        request.url = current_url.copy_with(
+            query=_merge_query_params(current_url.query, raw_query)
+        )
+
+    hooks.append(merge_base_query)
+    http_client = DefaultAsyncHttpxClient(
+        event_hooks={"request": hooks},
+        follow_redirects=True,
+    )
+
+    lower_path = path.lower()
+    has_deployment_path = (
+        "/openai/deployments/" in lower_path
+        or "/openai/v1/deployments/" in lower_path
+    )
+    uses_v1 = (
+        not has_deployment_path
+        and (
+            api_version in _AZURE_V1_API_VERSIONS
+            or lower_path.endswith("/openai/v1")
+        )
+    )
+    if uses_v1:
+        if lower_path.endswith("/openai"):
+            client_base_url = append_url_path(clean_url, "v1")
+        elif lower_path.endswith("/openai/v1"):
+            client_base_url = clean_url
+        else:
+            client_base_url = append_url_path(clean_url, "openai/v1")
+        client = AsyncOpenAI(
+            api_key=params.get("api_key") or "EMPTY",
+            base_url=client_base_url,
+            default_headers=_model_scoped_openai_headers(
+                client_base_url, params.get("api_key") or "EMPTY"
+            ),
+            http_client=http_client,
+        )
+    elif has_deployment_path:
+        client = AsyncAzureOpenAI(
+            api_key=params.get("api_key") or "EMPTY",
+            api_version=api_version,
+            base_url=clean_url,
+            default_headers=_model_scoped_azure_headers(
+                params.get("api_key") or "EMPTY"
+            ),
+            http_client=http_client,
+        )
+    else:
+        endpoint_path = path
+        if lower_path.endswith("/openai"):
+            endpoint_path = path[:-len("/openai")].rstrip("/")
+        azure_endpoint = urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            endpoint_path,
+            "",
+            "",
+        ))
+        # Let the SDK derive the deployment from LiteLLM's final request model.
+        # The model in params may still carry an Azure provider prefix.
+        client = AsyncAzureOpenAI(
+            api_key=params.get("api_key") or "EMPTY",
+            api_version=api_version,
+            azure_endpoint=azure_endpoint,
+            default_headers=_model_scoped_azure_headers(
+                params.get("api_key") or "EMPTY"
+            ),
+            http_client=http_client,
+        )
+
+    if isinstance(client, AsyncAzureOpenAI):
+        # The SDK reads AZURE_OPENAI_AD_TOKEN even with an explicit API key.
+        # This model-scoped client must use only its configured key.
+        client._azure_ad_token = None
+
+    params[endpoint_key] = clean_url
+    params["client"] = client
+    return client
+
+
+def _attach_litellm_query_client(
+    params: Dict[str, Any],
+    request_hooks: Optional[List[Any]] = None,
+) -> Optional[Any]:
+    """Attach a provider-compatible client when a provider base carries a query."""
+    endpoint_key = "api_base" if "api_base" in params else "base_url"
+    base_url = params.get(endpoint_key)
+    if not isinstance(base_url, _LiteLLMQueryBaseURL):
+        return None
+
+    provider = params.get("custom_llm_provider")
+    if isinstance(provider, str) and provider.lower() == "azure":
+        return _attach_azure_query_client(params, request_hooks)
 
     from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 
@@ -580,39 +751,6 @@ def _attach_responses_query_client(
     base_url = params.get("api_base", params.get("base_url"))
     extra_query = _encode_query_mapping(params.get("extra_query"))
     request_hooks: List[Any] = []
-
-    # The explicit OpenAI Chat prefix makes LiteLLM bridge Responses through
-    # ``acompletion``. That path expects an AsyncOpenAI client, not LiteLLM's
-    # lower-level AsyncHTTPHandler used by native Responses providers.
-    model = params.get("model")
-    forced_openai_chat = (
-        isinstance(model, str)
-        and model.strip().startswith(
-            _OPENAI_CHAT_COMPLETIONS_RESPONSES_PREFIX
-        )
-    )
-    if forced_openai_chat:
-        # ``_build_kwargs`` supplies the provider default as a plain string
-        # when no model-level ``base_url`` is configured. Normalize that
-        # value here so a request-level query still uses the AsyncOpenAI
-        # client required by LiteLLM's Chat Completions bridge.
-        if extra_query and isinstance(base_url, str) and not isinstance(
-            base_url, _OpenAIQueryBaseURL
-        ):
-            api_root, raw_query = _openai_endpoint_parts(base_url)
-            base_url = _OpenAIQueryBaseURL(api_root, raw_query)
-            params["api_base"] = base_url
-
-    if forced_openai_chat and isinstance(base_url, _OpenAIQueryBaseURL):
-        params["api_base"] = _OpenAIQueryBaseURL(
-            str(base_url),
-            _merge_query_params(base_url.raw_query, extra_query),
-        )
-        if extra_query:
-            params.pop("extra_query", None)
-        return _attach_openai_query_client(
-            params, endpoint_key="api_base",
-        )
 
     if omit_input:
         async def remove_placeholder_input(request: httpx.Request) -> None:
@@ -924,49 +1062,6 @@ _RESPONSES_COMPAT_EXTRA_BODY_PARAMS = frozenset({
     "thinking",
 })
 
-# LiteLLM's Responses-to-Chat bridge accepts these fields at its public
-# boundary but cannot preserve their Responses semantics. Harmless default
-# values are allowed below; meaningful values must fail before any HTTP call.
-_RESPONSES_FALLBACK_UNSUPPORTED_PARAMS = frozenset({
-    "conversation",
-    "context_management",
-    "include",
-    "max_tool_calls",
-    "metadata",
-    "moderation",
-    "partial_images",
-    "prompt",
-    "prompt_cache_key",
-    "prompt_cache_options",
-    "prompt_cache_retention",
-    "safety_identifier",
-    "service_tier",
-    "stream_options",
-    "top_logprobs",
-})
-
-# These are the only Responses tools that LiteLLM's Chat Completions bridge
-# deterministically converts and converts back. Built-in, namespace, and future
-# tool types are provider-dependent, emulated, flattened, silently dropped, or
-# passed through in a non-Chat shape, so reject them before starting a stream.
-_RESPONSES_FALLBACK_SUPPORTED_TOOL_TYPES = frozenset({
-    "custom",
-    "function",
-})
-
-_RESPONSES_FALLBACK_SUPPORTED_INPUT_TYPES = frozenset({
-    "message",
-    "function_call",
-    "function_call_output",
-    "custom_tool_call",
-    "custom_tool_call_output",
-})
-
-_RESPONSES_FALLBACK_RICH_TOOL_OUTPUT_TYPES = frozenset({
-    "input_file",
-    "input_image",
-})
-
 _RESPONSES_PROTECTED_HEADERS = frozenset({
     "authorization",
     "api-key",
@@ -981,7 +1076,7 @@ _RESPONSES_PROTECTED_HEADERS = frozenset({
 
 # ``extra_body`` is merged into the provider payload after LiteLLM has built the
 # request. Standard fields must stay owned by this wrapper so extensions cannot
-# override routing or bypass native/fallback validation.
+# override routing or bypass native-provider validation.
 _RESPONSES_PROTECTED_EXTRA_BODY_KEYS = _RESPONSES_REQUEST_FIELDS | frozenset({
     "messages",
     "api_key",
@@ -1008,15 +1103,31 @@ def _responses_provider_uses_chat_fallback(
     # LiteLLM treats this model prefix as an explicit request to route the
     # Responses API through its Chat Completions bridge, even though OpenAI
     # otherwise has a native Responses provider config.
-    forced_openai_chat = (
-        isinstance(model, str)
-        and model.strip().startswith(
+    # Check both the caller's model and the model after explicit-provider
+    # normalization.  ``resolve_litellm_route`` strips the first recognized
+    # provider prefix when ``provider`` is supplied, so a value such as
+    # ``openai/openai/chat_completions/gpt-4o`` would otherwise become the
+    # bridge-selecting ``openai/chat_completions/gpt-4o`` after this check.
+    # When no provider is supplied, LiteLLM performs the same one-prefix
+    # normalization internally.  ``resolve_litellm_route`` intentionally
+    # preserves the prefix for that case, so include ``split_model_name``'s
+    # provider-neutral model id as an additional candidate.
+    normalized_model = split_model_name(model)[0] if provider is None else None
+    candidate_models = (model, routed_model, normalized_model)
+    # LiteLLM honors this prefix even with a different explicit provider.
+    forced_openai_chat = any(
+        isinstance(candidate, str)
+        and candidate.strip().startswith(
             _OPENAI_CHAT_COMPLETIONS_RESPONSES_PREFIX
         )
-        and provider_name == "openai"
+        for candidate in candidate_models
     )
     if forced_openai_chat:
         return True, provider_name
+    # Capability can depend on the bare model id (for example Bedrock Mantle).
+    # Do not call LiteLLM's runtime resolver here: it can acquire credentials
+    # and start synchronous device authentication before validation finishes.
+    routed_model = routed_model.removeprefix(f"{provider_name}/")
     native_config = ProviderConfigManager.get_provider_responses_api_config(
         provider=provider_name,
         model=routed_model,
@@ -1024,172 +1135,21 @@ def _responses_provider_uses_chat_fallback(
     return native_config is None, provider_name
 
 
-def _validate_responses_fallback_params(
-    params: Dict[str, Any], provider: str, *, input_omitted: bool = False,
-) -> None:
-    """Reject Responses semantics the Chat Completions bridge cannot honor."""
-    unsupported = {
-        key
-        for key in _RESPONSES_FALLBACK_UNSUPPORTED_PARAMS
-        if params.get(key) not in (None, False, "", [], {})
-    }
-    if params.get("previous_response_id") is not None:
-        unsupported.add("previous_response_id")
-    if params.get("store") is True:
-        unsupported.add("store")
-    if params.get("background") is True:
-        unsupported.add("background")
-    if params.get("truncation") not in (None, "disabled"):
-        unsupported.add("truncation")
-    if input_omitted:
-        unsupported.add("input (omitted)")
-
-    unsupported_input_types = set()
-    unsupported_features = set()
-
-    def find_lossy_content(value: Any) -> None:
-        if isinstance(value, (list, tuple)):
-            for child in value:
-                find_lossy_content(child)
-            return
-        if not isinstance(value, dict):
-            return
-        value_type = value.get("type")
-        if (
-            value_type == "input_image"
-            and value.get("file_id") not in (None, False, "", [], {})
-        ):
-            unsupported_features.add("input_image.file_id")
-        if value_type in {"input_text", "input_image", "input_file"} and (
-            "prompt_cache_breakpoint" in value
-            and value["prompt_cache_breakpoint"] is not None
-        ):
-            unsupported_features.add(
-                f"{value_type}.prompt_cache_breakpoint"
-            )
-        if value_type == "input_file":
-            for field in ("filename", "detail"):
-                if field in value and value[field] is not None:
-                    unsupported_features.add(f"input_file.{field}")
-        if value_type in {
-            "function_call_output", "custom_tool_call_output",
-        }:
-            output = value.get("output")
-            if isinstance(output, (list, tuple)):
-                for part in output:
-                    if not isinstance(part, dict):
-                        continue
-                    part_type = part.get("type")
-                    if part_type in _RESPONSES_FALLBACK_RICH_TOOL_OUTPUT_TYPES:
-                        unsupported_features.add(
-                            f"{value_type}.output.{part_type}"
-                        )
-        for nested_key in ("content", "output"):
-            if nested_key in value:
-                find_lossy_content(value[nested_key])
-
-    response_input = params.get("input")
-    if isinstance(response_input, list):
-        for item in response_input:
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type") or "message"
-            if (
-                not isinstance(item_type, str)
-                or item_type not in _RESPONSES_FALLBACK_SUPPORTED_INPUT_TYPES
-            ):
-                unsupported_input_types.add(str(item_type))
-            if item_type == "message" and item.get("phase") is not None:
-                unsupported_features.add("message.phase")
-            find_lossy_content(item)
-
-    text = params.get("text")
-    if isinstance(text, dict):
-        for key, value in text.items():
-            if key != "format" and value not in (None, False, "", [], {}):
-                unsupported_features.add(f"text.{key}")
-
-    reasoning = params.get("reasoning")
-    if isinstance(reasoning, dict):
-        for key, value in reasoning.items():
-            if key != "effort" and value not in (None, False, "", [], {}):
-                unsupported_features.add(f"reasoning.{key}")
-
-    tool_choice = params.get("tool_choice")
-    if isinstance(tool_choice, dict):
-        choice_type = tool_choice.get("type")
-        supported_choice_types = {
-            "auto", "none", "required", "tool", "any", "function", "custom",
-        }
-        if (
-            not isinstance(choice_type, str)
-            or choice_type not in supported_choice_types
-        ):
-            choice_label = (
-                choice_type
-                if isinstance(choice_type, str) and choice_type
-                else "object"
-            )
-            unsupported_features.add(
-                f"tool_choice.{choice_label}"
-            )
-
-    unsupported_tools = set()
-    tools = params.get("tools")
-    if isinstance(tools, (list, tuple)):
-        for tool in tools:
-            if not isinstance(tool, dict):
-                unsupported_tools.add("invalid")
-                continue
-            tool_type = tool.get("type")
-            if (
-                not isinstance(tool_type, str)
-                or tool_type not in _RESPONSES_FALLBACK_SUPPORTED_TOOL_TYPES
-            ):
-                unsupported_tools.add(
-                    tool_type
-                    if isinstance(tool_type, str) and tool_type
-                    else "invalid"
-                )
-                continue
-            if tool_type == "function" and "output_schema" in tool:
-                unsupported_features.add("function.output_schema")
-            if (
-                tool_type == "custom"
-                and tool.get("defer_loading") not in (None, False)
-            ):
-                unsupported_features.add("custom.defer_loading")
-    elif tools is not None:
-        unsupported_features.add("tools (must be an array)")
-
-    if (
-        not unsupported
-        and not unsupported_tools
-        and not unsupported_input_types
-        and not unsupported_features
-    ):
-        return
-
-    details = []
-    if unsupported:
-        details.append("parameter(s): " + ", ".join(sorted(unsupported)))
-    if unsupported_tools:
-        details.append(
-            "tool type(s): " + ", ".join(sorted(unsupported_tools))
-        )
-    if unsupported_input_types:
-        details.append(
-            "input item type(s): "
-            + ", ".join(sorted(unsupported_input_types))
-        )
-    if unsupported_features:
-        details.append(
-            "feature(s): " + ", ".join(sorted(unsupported_features))
-        )
-    raise ValueError(
-        f"Responses {'; '.join(details)} are not supported for provider "
-        f"{provider!r} because LiteLLM uses its Chat Completions fallback"
+def _require_native_responses_provider(
+    model: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> str:
+    """Reject providers that LiteLLM would bridge through Chat Completions."""
+    uses_chat_fallback, resolved_provider = (
+        _responses_provider_uses_chat_fallback(model, provider, base_url)
     )
+    if uses_chat_fallback:
+        raise ValueError(
+            "/v1/responses requires a native Responses provider; "
+            f"provider={resolved_provider!r}, model={model!r}"
+        )
+    return resolved_provider
 
 
 def _validate_responses_extras(
@@ -1303,33 +1263,68 @@ def _validate_responses_request(body: Any) -> None:
 
 
 def _responses_text_from_response_format(response_format: Any) -> Any:
-    """Translate Chat Completions structured-output formats to Responses.
+    """Normalize compatibility structured-output formats for Responses.
 
     Chat Completions nests JSON schema metadata under ``json_schema`` while
     Responses expects ``name``, ``schema`` and ``strict`` directly under
     ``text.format``. Native Responses ``{"format": ...}`` values are kept
     unchanged so callers can use either request shape.
     """
+    if isinstance(response_format, type):
+        from litellm.llms.base_llm.base_utils import type_to_response_format_param
+
+        response_format = type_to_response_format_param(response_format)
+
     if not isinstance(response_format, dict):
         return {"format": response_format}
 
     if "format" in response_format:
-        return response_format
+        format_value = response_format["format"]
+        if not isinstance(format_value, dict):
+            raise ValueError("Responses text.format must be an object")
+        if format_value.get("type") == "json_schema":
+            nested_schema = format_value.get("json_schema")
+            if isinstance(nested_schema, dict):
+                format_value = {
+                    "type": "json_schema",
+                    "name": nested_schema.get("name", "response_schema"),
+                    "schema": nested_schema.get("schema", {}),
+                    "strict": nested_schema.get("strict", False),
+                }
+        return {
+            **{
+                key: value for key, value in response_format.items()
+                if key != "format"
+            },
+            "format": format_value,
+        }
 
-    if response_format.get("type") != "json_schema":
+    format_type = response_format.get("type")
+    if isinstance(format_type, str) and format_type in {"json_object", "text"}:
         return {"format": response_format}
+
+    if format_type != "json_schema":
+        raise ValueError(
+            "structured output format must be json_schema, json_object, or text"
+        )
 
     json_schema = response_format.get("json_schema")
-    if not isinstance(json_schema, dict):
-        return {"format": response_format}
+    if isinstance(json_schema, dict):
+        format_value = {
+            "type": "json_schema",
+            "name": json_schema.get("name", "response_schema"),
+            "schema": json_schema.get("schema", {}),
+            "strict": json_schema.get("strict", False),
+        }
+        return {"format": format_value}
 
-    format_value = {
-        "type": "json_schema",
-        "name": json_schema.get("name", "response_schema"),
-        "schema": json_schema.get("schema", {}),
-        "strict": json_schema.get("strict", False),
-    }
-    return {"format": format_value}
+    # Also accept the flattened Responses format object when it is supplied
+    # directly as a text_format/response_format dictionary.
+    if "schema" in response_format or "name" in response_format:
+        return {"format": dict(response_format)}
+    raise ValueError(
+        "json_schema format must contain a json_schema object or a schema"
+    )
 
 
 def _build_responses_kwargs(
@@ -1380,9 +1375,7 @@ def _build_responses_kwargs(
         )
     _validate_responses_background(kwargs.get("background"))
 
-    uses_chat_fallback, resolved_provider = (
-        _responses_provider_uses_chat_fallback(model, provider, base_url)
-    )
+    _require_native_responses_provider(model, provider, base_url)
 
     routing = _build_kwargs(
         model=model,
@@ -1393,22 +1386,9 @@ def _build_responses_kwargs(
         responses=True,
     )
     routing.pop("messages")
-    forced_openai_chat = (
-        isinstance(model, str)
-        and model.strip().startswith(
-            _OPENAI_CHAT_COMPLETIONS_RESPONSES_PREFIX
-        )
-        and resolved_provider == "openai"
-    )
-    if forced_openai_chat:
-        # An explicit provider normally strips the recognized ``openai/``
-        # prefix. Keep LiteLLM's complete opt-in prefix intact so it still
-        # selects the Chat Completions bridge.
-        routing["model"] = model.strip()
-        routing.pop("custom_llm_provider", None)
     # LiteLLM's Responses API accepts the endpoint as ``api_base``. Its
-    # Chat Completions wrapper accepts ``base_url``, but Responses silently
-    # falls back to the provider default when that alias is left in kwargs.
+    # native wrapper accepts ``api_base``; normalize the configuration helper's
+    # alias before handing it to LiteLLM.
     if "base_url" in routing:
         routing["api_base"] = routing.pop("base_url")
     input_omitted = input is _MISSING_RESPONSES_INPUT
@@ -1432,13 +1412,13 @@ def _build_responses_kwargs(
             "budget_tokens": thinking_budget,
         }
         params["thinking"] = thinking
-        if not uses_chat_fallback:
-            compat_extra_body["thinking"] = thinking
+        compat_extra_body["thinking"] = thinking
     if stream is not None:
         params["stream"] = stream
 
-    if text_format is not None:
-        params["text_format"] = text_format
+    if text_format is not None and kwargs.get("text") is None:
+        text = _responses_text_from_response_format(text_format)
+        params["text"] = text
     if (
         response_format is not None
         and text_format is None
@@ -1446,7 +1426,8 @@ def _build_responses_kwargs(
     ):
         # Compatibility with clients that reuse Chat Completions' structured
         # output field when switching to the Responses endpoint.
-        params["text"] = _responses_text_from_response_format(response_format)
+        text = _responses_text_from_response_format(response_format)
+        params["text"] = text
     if extra_headers is not None:
         params["extra_headers"] = extra_headers
     if extra_query is not None:
@@ -1460,16 +1441,8 @@ def _build_responses_kwargs(
         value = kwargs.get(key)
         if value is not None:
             params[key] = value
-            if (
-                not uses_chat_fallback
-                and key in _RESPONSES_COMPAT_EXTRA_BODY_PARAMS
-            ):
+            if key in _RESPONSES_COMPAT_EXTRA_BODY_PARAMS:
                 compat_extra_body[key] = value
-
-    if uses_chat_fallback:
-        _validate_responses_fallback_params(
-            params, resolved_provider, input_omitted=input_omitted,
-        )
 
     if extra_body:
         compat_extra_body = {**compat_extra_body, **extra_body}

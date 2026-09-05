@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 import yaml
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 from openai.types.responses import ResponsesServerEvent
 from openai.types.responses.response import Response as OpenAIResponse
 
@@ -168,6 +168,59 @@ def test_responses_base_url_accepts_full_resource_path_and_query():
     normalized = params["api_base"]
     assert normalized == "https://gateway.example/v1"
     assert normalized.raw_query == b"tenant=acme"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_url"),
+    [
+        (
+            "https://gateway.example/openai/deployments/weather"
+            "/chat/completions?api-version=2024-01-01",
+            "https://gateway.example/openai/responses"
+            "?api-version=2024-01-01",
+        ),
+        (
+            "https://gateway.example/openai/v1/deployments/weather"
+            "/chat/completions?api-version=2024-01-01",
+            "https://gateway.example/openai/responses"
+            "?api-version=2024-01-01",
+        ),
+    ],
+)
+def test_azure_responses_strips_chat_resource_before_deployment(
+    monkeypatch, base_url, expected_url,
+):
+    requests = []
+
+    async def fake_send(client, request, **kwargs):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={
+                "id": "resp_azure_chat_base",
+                "object": "response",
+                "created_at": 1_725_000_000,
+                "status": "completed",
+                "model": "weather",
+                "output": [],
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+
+    asyncio.run(
+        llm_module.llm_response(
+            model="weather",
+            provider="azure",
+            input="hello",
+            api_key="test-key",
+            base_url=base_url,
+        )
+    )
+
+    assert [str(request.url) for request in requests] == [expected_url]
 
 
 @pytest.mark.parametrize(
@@ -654,7 +707,8 @@ def test_responses_wrapper_forwards_supported_extensions(monkeypatch):
     )
 
     sent = aresponses.await_args.kwargs
-    assert sent["text_format"] == {"type": "json_object"}
+    assert sent["text"] == {"format": {"type": "json_object"}}
+    assert "text_format" not in sent
     assert sent["extra_headers"] == {"X-Request-ID": "trace-123"}
     assert sent["extra_query"] == {"tenant": "acme"}
     assert sent["timeout"] == 30
@@ -693,7 +747,7 @@ def test_responses_wrapper_forwards_supported_extensions(monkeypatch):
         ),
     ],
 )
-def test_responses_wrapper_translates_chat_response_format(
+def test_responses_wrapper_normalizes_response_format(
     monkeypatch, response_format, expected_text,
 ):
     response = Mock()
@@ -716,6 +770,132 @@ def test_responses_wrapper_translates_chat_response_format(
 
     assert aresponses.await_args.kwargs["text"] == expected_text
     assert "response_format" not in aresponses.await_args.kwargs
+
+
+def test_responses_wrapper_translates_pydantic_response_format(monkeypatch):
+    class Answer(BaseModel):
+        value: str
+
+    response = Mock()
+    response.model_dump.return_value = {
+        "id": "resp_pydantic_format",
+        "object": "response",
+        "status": "completed",
+        "output": [],
+    }
+    aresponses = AsyncMock(return_value=response)
+    monkeypatch.setattr(llm_module.litellm, "aresponses", aresponses)
+
+    asyncio.run(
+        llm_module.llm_response(
+            model="openai/gpt-4o",
+            input="hello",
+            response_format=Answer,
+        )
+    )
+
+    sent = aresponses.await_args.kwargs
+    format_value = sent["text"]["format"]
+    assert format_value["type"] == "json_schema"
+    assert format_value["name"] == "Answer"
+    assert format_value["strict"] is True
+    assert format_value["schema"]["properties"]["value"]["type"] == "string"
+    assert "response_format" not in sent
+
+
+@pytest.mark.parametrize(
+    "text_format",
+    [
+        {"type": "json_object"},
+        {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {"type": "object"},
+                "strict": True,
+            },
+        },
+        {
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": {"type": "object"},
+                "strict": True,
+            },
+        },
+    ],
+)
+def test_responses_wrapper_normalizes_text_format_dict(
+    monkeypatch, text_format,
+):
+    response = Mock()
+    response.model_dump.return_value = {
+        "id": "resp_text_format_dict",
+        "object": "response",
+        "status": "completed",
+        "output": [],
+    }
+    aresponses = AsyncMock(return_value=response)
+    monkeypatch.setattr(llm_module.litellm, "aresponses", aresponses)
+
+    asyncio.run(
+        llm_module.llm_response(
+            model="openai/gpt-4o",
+            input="hello",
+            text_format=text_format,
+        )
+    )
+
+    sent = aresponses.await_args.kwargs
+    assert sent["text"]["format"]["type"] in {"json_object", "json_schema"}
+    assert "text_format" not in sent
+
+
+def test_responses_wrapper_preserves_text_format_siblings(monkeypatch):
+    response = Mock()
+    response.model_dump.return_value = {
+        "id": "resp_text_options",
+        "object": "response",
+        "status": "completed",
+        "output": [],
+    }
+    aresponses = AsyncMock(return_value=response)
+    monkeypatch.setattr(llm_module.litellm, "aresponses", aresponses)
+
+    asyncio.run(
+        llm_module.llm_response(
+            model="openai/gpt-4o",
+            input="hello",
+            text_format={
+                "format": {"type": "text"},
+                "verbosity": "high",
+            },
+        )
+    )
+
+    assert aresponses.await_args.kwargs["text"] == {
+        "verbosity": "high",
+        "format": {"type": "text"},
+    }
+
+
+@pytest.mark.parametrize("invalid_type", [[], {}])
+def test_responses_wrapper_rejects_invalid_format_type_before_dispatch(
+    monkeypatch, invalid_type,
+):
+    aresponses = AsyncMock()
+    monkeypatch.setattr(llm_module.litellm, "aresponses", aresponses)
+
+    with pytest.raises(ValueError, match="structured output format"):
+        asyncio.run(
+            llm_module.llm_response(
+                model="openai/gpt-4o",
+                input="hello",
+                response_format={"type": invalid_type},
+            )
+        )
+
+    aresponses.assert_not_awaited()
 
 
 def test_responses_wrapper_prefers_native_text_over_response_format(
@@ -1253,6 +1433,129 @@ def test_responses_route_rejects_item_reference_with_verifier(
     stream_call.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("model", "provider", "base_url", "stream", "native"),
+    [
+        ("openai/gpt-4o", None, None, False, True),
+        (
+            "local-model",
+            "openai",
+            "https://gateway.example/v1",
+            False,
+            True,
+        ),
+        ("gemini/gemini-2.5-flash", None, None, False, False),
+        ("deepseek/deepseek-chat", None, None, True, False),
+        ("openai/chat_completions/gpt-4o", None, None, False, False),
+    ],
+)
+def test_responses_route_requires_native_provider(
+    tmp_path, monkeypatch, model, provider, base_url, stream, native,
+):
+    model_config = {"name": model, "api_key": "test-key"}
+    if provider is not None:
+        model_config["provider"] = provider
+    if base_url is not None:
+        model_config["base_url"] = base_url
+    server = ProxyServer(_config(tmp_path, models=[model_config]))
+    complete_call = AsyncMock(return_value=(_response_with_tool_call(), None))
+    stream_call = AsyncMock()
+    monkeypatch.setattr(server.backend, "complete_responses", complete_call)
+    monkeypatch.setattr(server.backend, "stream_responses", stream_call)
+
+    async def request_response():
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver",
+        ) as client:
+            return await client.post(
+                "/v1/responses",
+                json={"input": "hello", "stream": stream},
+            )
+
+    response = asyncio.run(request_response())
+
+    if native:
+        assert response.status_code == 200
+        complete_call.assert_awaited_once()
+        stream_call.assert_not_awaited()
+    else:
+        assert response.status_code == 400
+        error = response.json()["error"]["message"]
+        assert "/v1/responses requires a native Responses provider" in error
+        assert model in error
+        assert (provider or model.split("/", 1)[0]) in error
+        complete_call.assert_not_awaited()
+        stream_call.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_route_checks_each_verifier_candidate_before_dispatch(
+    tmp_path, monkeypatch, stream,
+):
+    server = ProxyServer(_config(tmp_path, models=[
+        {"name": "openai/gpt-4o", "api_key": "openai-key"},
+        {"name": "gemini/gemini-2.5-flash", "api_key": "gemini-key"},
+    ]))
+    server.backend.verifier = object()
+    complete_call = AsyncMock(return_value=(_response_with_tool_call(), None))
+    stream_call = AsyncMock()
+    monkeypatch.setattr(server.backend, "complete_responses", complete_call)
+    monkeypatch.setattr(server.backend, "stream_responses", stream_call)
+
+    async def request_response():
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver",
+        ) as client:
+            return await client.post(
+                "/v1/responses",
+                json={"input": "hello", "stream": stream},
+            )
+
+    response = asyncio.run(request_response())
+
+    assert response.status_code == 400
+    error = response.json()["error"]["message"]
+    assert "/v1/responses requires a native Responses provider" in error
+    assert "provider='gemini'" in error
+    assert "gemini/gemini-2.5-flash" in error
+    complete_call.assert_not_awaited()
+    stream_call.assert_not_awaited()
+
+
+@pytest.mark.parametrize("invalid_type", [[], {}])
+def test_responses_route_returns_400_for_invalid_format_type(
+    tmp_path, monkeypatch, invalid_type,
+):
+    server = ProxyServer(_config(tmp_path))
+    complete_call = AsyncMock()
+    stream_call = AsyncMock()
+    monkeypatch.setattr(server.backend, "complete_responses", complete_call)
+    monkeypatch.setattr(server.backend, "stream_responses", stream_call)
+
+    async def request_invalid():
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver",
+        ) as client:
+            return await client.post(
+                "/v1/responses",
+                json={
+                    "input": "hello",
+                    "response_format": {"type": invalid_type},
+                },
+            )
+
+    response = asyncio.run(request_invalid())
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "structured output format" in response.json()["error"]["message"]
+    complete_call.assert_not_awaited()
+    stream_call.assert_not_awaited()
+
+
 def test_backend_gather_responses_propagates_candidate_cancellation(
     tmp_path, monkeypatch,
 ):
@@ -1444,7 +1747,6 @@ def test_live_responses_preserves_progress_message_until_done(tmp_path):
         "sequence": 0,
         "response_id": None,
         "created_at": None,
-        "compact_output_indexes": False,
         "items_by_id": {},
         "item_indexes": {},
         "output_indexes": {},
@@ -1480,6 +1782,144 @@ def test_live_responses_preserves_progress_message_until_done(tmp_path):
 
     assert progress["response"]["output"][0]["status"] == "in_progress"
     assert done["item"]["status"] == "completed"
+
+
+def _collect_live_payloads(tmp_path, monkeypatch, events):
+    async def source():
+        for event in events:
+            yield event
+
+    monkeypatch.setattr(
+        backend_module, "llm_stream_response",
+        AsyncMock(return_value=source()),
+    )
+    backend = Backend(_config(tmp_path))
+
+    async def consume():
+        return [
+            _sse_payload(event)
+            async for event in backend.stream_responses(
+                '{"input":"hello","stream":true}'
+            )
+        ]
+
+    return asyncio.run(consume())
+
+
+def test_live_function_call_names_follow_interleaved_item_ids(
+    tmp_path, monkeypatch,
+):
+    items = [
+        {
+            "type": "function_call",
+            "id": f"fc_{index}",
+            "call_id": f"call_{index}",
+            "name": f"tool_{index}",
+            "arguments": json.dumps({"value": index}),
+            "status": "completed",
+        }
+        for index in range(2)
+    ]
+    events = [{
+        "type": "response.created",
+        "response": {"id": "resp_interleaved", "output": []},
+    }]
+    for index, item in enumerate(items):
+        events.append({
+            "type": "response.output_item.added",
+            "output_index": index,
+            "item": {**item, "arguments": "", "status": "in_progress"},
+        })
+    for index in (1, 0):
+        item = items[index]
+        events.extend([
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": index,
+                "item_id": item["id"],
+                "arguments": item["arguments"],
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": item,
+            },
+        ])
+    events.append({
+        "type": "response.completed",
+        "response": {
+            "id": "resp_interleaved", "status": "completed", "output": items,
+        },
+    })
+
+    payloads = _collect_live_payloads(tmp_path, monkeypatch, events)
+    adapter = TypeAdapter(ResponsesServerEvent)
+    for payload in payloads:
+        adapter.validate_python(payload)
+    arguments_done = [
+        payload for payload in payloads
+        if payload["type"] == "response.function_call_arguments.done"
+    ]
+    assert [
+        (payload["item_id"], payload["name"], payload["output_index"])
+        for payload in arguments_done
+    ] == [("fc_1", "tool_1", 1), ("fc_0", "tool_0", 0)]
+    for event_type in ("response.output_item.added", "response.output_item.done"):
+        assert sorted(
+            (payload["output_index"], payload["item"]["id"])
+            for payload in payloads if payload["type"] == event_type
+        ) == [(0, "fc_0"), (1, "fc_1")]
+    assert payloads[-1]["response"]["output"] == items
+
+
+@pytest.mark.parametrize("empty_text", [None, ""])
+def test_live_empty_message_lifecycle_is_atomic(
+    tmp_path, monkeypatch, empty_text,
+):
+    added_item = {
+        "id": "msg_empty", "type": "message", "role": "assistant",
+        "status": "in_progress", "content": [],
+    }
+    done_item = {
+        **added_item,
+        "status": "completed",
+        "content": [{
+            "type": "output_text", "text": empty_text, "annotations": [],
+        }],
+    }
+    payloads = _collect_live_payloads(tmp_path, monkeypatch, [
+        {
+            "type": "response.created",
+            "response": {"id": "resp_empty", "output": []},
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 0, "item": added_item,
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0, "item": done_item,
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_empty", "status": "completed",
+                "output": [done_item],
+            },
+        },
+    ])
+
+    adapter = TypeAdapter(ResponsesServerEvent)
+    for payload in payloads:
+        adapter.validate_python(payload)
+    for event_type in ("response.output_item.added", "response.output_item.done"):
+        assert [
+            (payload["output_index"], payload["item"]["id"])
+            for payload in payloads if payload["type"] == event_type
+        ] == [(0, "msg_empty")]
+    output = payloads[-1]["response"]["output"]
+    assert len(output) == 1
+    assert output[0]["id"] == "msg_empty"
 
 
 def test_responses_replay_standard_events_validate_with_openai_sdk(tmp_path):
@@ -2958,6 +3398,37 @@ def test_responses_route_rejects_invalid_requests_before_backend(
     assert response.json()["error"]["type"] == "invalid_request_error"
     assert response.json()["error"]["message"] == message
     complete_call.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_route_rejects_unknown_top_level_field_before_dispatch(
+    tmp_path, monkeypatch, stream,
+):
+    server = ProxyServer(_config(tmp_path))
+    complete_call = AsyncMock()
+    stream_call = AsyncMock()
+    monkeypatch.setattr(server.backend, "complete_responses", complete_call)
+    monkeypatch.setattr(server.backend, "stream_responses", stream_call)
+
+    async def request_invalid():
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver",
+        ) as client:
+            return await client.post(
+                "/v1/responses",
+                json={"input": "hello", "max_output_token": 1, "stream": stream},
+            )
+
+    response = asyncio.run(request_invalid())
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]["message"] == (
+        "unsupported Responses parameter(s): max_output_token"
+    )
+    complete_call.assert_not_awaited()
+    stream_call.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

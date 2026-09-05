@@ -281,13 +281,6 @@ class Backend:
             # Responses call for each candidate.
             params.pop("stream_options", None)
             response = await llm_response(**params)
-            uses_chat_fallback, _ = _responses_provider_uses_chat_fallback(
-                params["model"],
-                params.get("provider"),
-                params.get("base_url"),
-            )
-            if uses_chat_fallback:
-                response = self._normalise_responses_result(response)
             return response, name
 
         results = await asyncio.gather(
@@ -981,7 +974,7 @@ class Backend:
         return params
 
     def validate_responses_body(self, responses_body: dict) -> None:
-        """Validate request shape and every configured provider before I/O."""
+        """Validate request shape and providers before any Responses I/O."""
         _validate_responses_request(responses_body)
         if self.verifier:
             incompatible = []
@@ -1009,6 +1002,36 @@ class Backend:
                 "provider": self.config.default_model.get("provider"),
             }
         ]
+        non_native = []
+        for entry in entries:
+            name = entry["name"]
+            api_key = entry.get("api_key", "")
+            params = {
+                **params_base,
+                "model": name,
+                "api_key": api_key,
+                **{
+                    key: value
+                    for key, value in entry.items()
+                    if key not in ("name", "api_key", "num_candidates")
+                },
+            }
+            uses_chat_fallback, resolved_provider = _responses_provider_uses_chat_fallback(
+                name,
+                params.get("provider"),
+                params.get("base_url"),
+            )
+            if uses_chat_fallback:
+                non_native.append(
+                    f"provider={resolved_provider!r}, model={name!r}"
+                )
+
+        if non_native:
+            raise ValueError(
+                "/v1/responses requires a native Responses provider; "
+                + "; ".join(non_native)
+            )
+
         for entry in entries:
             name = entry["name"]
             api_key = entry.get("api_key", "")
@@ -1305,13 +1328,6 @@ class Backend:
         else:
             logger.info(f"BACKEND calling {self.model_name} (responses)")
             final_result = await llm_response(**params)
-            uses_chat_fallback, _ = _responses_provider_uses_chat_fallback(
-                params["model"],
-                params.get("provider"),
-                params.get("base_url"),
-            )
-            if uses_chat_fallback:
-                final_result = self._normalise_responses_result(final_result)
             req_log["responses"] = [
                 {"model": self.model_name, "response": final_result}
             ]
@@ -1360,17 +1376,11 @@ class Backend:
             return
 
         logger.info(f"BACKEND streaming {self.model_name} (responses)")
-        uses_chat_fallback, _ = _responses_provider_uses_chat_fallback(
-            params["model"],
-            params.get("provider"),
-            params.get("base_url"),
-        )
         stream = await llm_stream_response(**params)
         stream_state = {
             "sequence": 0,
             "response_id": None,
             "created_at": None,
-            "compact_output_indexes": uses_chat_fallback,
             "items_by_id": {},
             "item_indexes": {},
             "output_indexes": {},
@@ -1472,11 +1482,7 @@ class Backend:
             )
             if mapped_index is None and isinstance(item_id, str) and item_id:
                 mapped_index = state["item_indexes"].get(item_id)
-            if (
-                mapped_index is None
-                and valid_source_index
-                and not state["compact_output_indexes"]
-            ):
+            if mapped_index is None and valid_source_index:
                 mapped_index = source_index
             if mapped_index is None:
                 mapped_index = state["next_output_index"]
@@ -1508,8 +1514,7 @@ class Backend:
                 mapped_index = state["item_indexes"].get(item_id)
             if mapped_index is None:
                 if (
-                    state["compact_output_indexes"]
-                    or not isinstance(source_index, int)
+                    not isinstance(source_index, int)
                     or isinstance(source_index, bool)
                     or source_index < 0
                 ):
@@ -1600,42 +1605,15 @@ class Backend:
             if not isinstance(raw_output, list):
                 raw_output = []
             if event_type in terminal_statuses:
-                if (
-                    state["compact_output_indexes"]
-                    and state["item_indexes"]
-                ):
-                    indexed_output = {}
-                    for source_index, item in enumerate(raw_output):
-                        dumped_item = self._dump_responses_event(item)
-                        item_id = (
-                            dumped_item.get("id")
-                            if isinstance(dumped_item, dict)
-                            else None
-                        )
-                        mapped_index = None
-                        if isinstance(item_id, str):
-                            mapped_index = state["item_indexes"].get(item_id)
-                        if mapped_index is None:
-                            mapped_index = state["output_indexes"].get(
-                                source_index
-                            )
-                        if mapped_index is not None:
-                            indexed_output[mapped_index] = item
-                    indexed_output.update(state["done_items"])
-                    raw_output = [
-                        indexed_output[index]
-                        for index in sorted(indexed_output)
-                    ]
-                else:
-                    indexed_output = {
-                        index: item for index, item in enumerate(raw_output)
-                    }
-                    for index, item in state["done_items"].items():
-                        indexed_output.setdefault(index, item)
-                    raw_output = [
-                        indexed_output[index]
-                        for index in sorted(indexed_output)
-                    ]
+                indexed_output = {
+                    index: item for index, item in enumerate(raw_output)
+                }
+                for index, item in state["done_items"].items():
+                    indexed_output.setdefault(index, item)
+                raw_output = [
+                    indexed_output[index]
+                    for index in sorted(indexed_output)
+                ]
             output = self._normalise_responses_output(
                 raw_output,
                 response_status=status,
@@ -1761,7 +1739,7 @@ class Backend:
         self, output: Any, *, response_status: str,
         preserve_empty_messages: bool = False,
     ) -> list:
-        """Clean output artifacts produced by LiteLLM's Chat fallback."""
+        """Normalize output items for the OpenAI Responses event schema."""
         if not isinstance(output, list):
             return []
 
@@ -1858,29 +1836,6 @@ class Backend:
 
             normalised.append(item)
         return normalised
-
-    def _normalise_responses_result(self, response: Any) -> dict:
-        """Normalize a non-streaming Chat fallback result for OpenAI clients."""
-        if hasattr(response, "model_dump"):
-            try:
-                response = response.model_dump(mode="json")
-            except TypeError:
-                response = response.model_dump()
-        source = dict(response) if isinstance(response, dict) else {}
-        status = source.get("status") or "completed"
-        if isinstance(status, Enum):
-            status = status.value
-        if status not in {
-            "completed", "failed", "in_progress", "cancelled", "queued",
-            "incomplete",
-        }:
-            raise ValueError(f"Unsupported Responses status: {status!r}")
-        output = self._normalise_responses_output(
-            source.get("output"), response_status=status,
-        )
-        return self._normalise_responses_envelope(
-            source, status=status, output=output,
-        )
 
     async def _replay_responses_sse(
         self, response: dict,

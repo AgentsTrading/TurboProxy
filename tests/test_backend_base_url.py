@@ -274,6 +274,145 @@ def test_litellm_base_url_with_query_is_endpoint_safe(
     ) == expected_url
 
 
+@pytest.mark.parametrize("base_path, endpoint_path", [
+    ("", "/openai/deployments/gpt-4o/chat/completions"),
+    ("/openai", "/openai/deployments/gpt-4o/chat/completions"),
+    (
+        "/openai/deployments/gpt-4o/chat/completions",
+        "/openai/deployments/gpt-4o/chat/completions",
+    ),
+    (
+        "/openai/v1/deployments/gpt-4o/chat/completions",
+        "/openai/v1/deployments/gpt-4o/chat/completions",
+    ),
+    ("/openai/v1", "/openai/v1/chat/completions"),
+])
+@pytest.mark.parametrize("model", ["gpt-4o", "azure/gpt-4o"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("version_in_url", [False, True])
+def test_azure_chat_query_uses_sdk_async_client_and_preserves_endpoint(
+    monkeypatch, base_path, endpoint_path, model, stream, version_in_url,
+):
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+    from openai import AsyncAzureOpenAI, AsyncOpenAI
+
+    endpoint = "https://gateway.example" + endpoint_path
+    base_url = "https://gateway.example" + base_path + (
+        "?api-version=2024-01-01&tenant=acme"
+        if version_in_url else "?tenant=acme"
+    )
+    monkeypatch.setenv(
+        "AZURE_API_VERSION", "2024-06-01" if version_in_url else "2024-01-01",
+    )
+    monkeypatch.setenv("AZURE_OPENAI_AD_TOKEN", "ambient-azure-token")
+    monkeypatch.setenv("OPENAI_ORG_ID", "ambient-org")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "ambient-project")
+    monkeypatch.setenv(
+        "OPENAI_CUSTOM_HEADERS",
+        "X-Ambient-Secret: ambient-header\n"
+        "Authorization: Bearer ambient-key\n"
+        "api-key: ambient-api-key",
+    )
+    requests = []
+
+    async def fake_send(client, request, **kwargs):
+        for hook in client._event_hooks.get("request", ()):
+            await hook(request)
+        requests.append(request)
+        if stream:
+            chunk = {
+                "id": "chatcmpl-azure-query",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }],
+            }
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={
+                "id": "chatcmpl-azure-query",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+
+    async def request_completion():
+        completion = (
+            llm_module.llm_stream_completion if stream
+            else llm_module.llm_completion
+        )
+        result = await completion(
+            model=model,
+            provider="azure",
+            messages=[{"role": "user", "content": "hello"}],
+            api_key="test-key",
+            base_url=base_url,
+        )
+        if stream:
+            return "".join([
+                chunk.choices[0].delta.content or ""
+                async for chunk in result if chunk.choices
+            ])
+        return result["choices"][0]["message"]["content"]
+
+    assert asyncio.run(request_completion()) == "ok"
+    expected_query = (
+        "?tenant=acme"
+        if base_path == "/openai/v1" and not version_in_url
+        else "?api-version=2024-01-01&tenant=acme"
+    )
+    assert [str(request.url) for request in requests] == [
+        endpoint + expected_query
+    ]
+    assert json.loads(requests[0].content)["model"] == "gpt-4o"
+    if endpoint_path == "/openai/v1/chat/completions":
+        assert requests[0].headers["authorization"] == "Bearer test-key"
+        assert "api-key" not in requests[0].headers
+    else:
+        assert requests[0].headers["api-key"] == "test-key"
+        assert "authorization" not in requests[0].headers
+    assert "openai-organization" not in requests[0].headers
+    assert "openai-project" not in requests[0].headers
+    assert "x-ambient-secret" not in requests[0].headers
+
+    params = llm_module._build_kwargs(
+        model=model,
+        messages=[{"role": "user", "content": "hello"}],
+        api_key="test-key",
+        base_url=base_url,
+        provider="azure",
+    )
+    client = llm_module._attach_litellm_query_client(params)
+    assert isinstance(client, (AsyncAzureOpenAI, AsyncOpenAI))
+    assert not isinstance(client, AsyncHTTPHandler)
+    asyncio.run(client.close())
+
+
 @pytest.mark.parametrize(
     ("provider", "base_url", "expected_url"),
     [

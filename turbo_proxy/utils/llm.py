@@ -8,6 +8,7 @@ import asyncio
 import json
 import math
 import os
+import re
 from numbers import Real
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -1074,6 +1075,11 @@ _RESPONSES_PROTECTED_HEADERS = frozenset({
     "cookie",
 })
 
+# RFC 9110 field names are tokens. HTTPX encodes string header values as ASCII;
+# permit visible characters and internal spaces/tabs, but no control characters.
+_RESPONSES_HEADER_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_RESPONSES_HEADER_VALUE = re.compile(r"[\t\x20-\x7e]*")
+
 # ``extra_body`` is merged into the provider payload after LiteLLM has built the
 # request. Standard fields must stay owned by this wrapper so extensions cannot
 # override routing or bypass native-provider validation.
@@ -1165,6 +1171,18 @@ def _validate_responses_extras(
             raise ValueError("extra_headers keys must be non-empty strings")
         if any(not isinstance(value, str) for value in extra_headers.values()):
             raise ValueError("extra_headers values must be strings")
+        if any(_RESPONSES_HEADER_NAME.fullmatch(key) is None for key in extra_headers):
+            raise ValueError("extra_headers keys must be valid HTTP header names")
+        if any(
+            _RESPONSES_HEADER_VALUE.fullmatch(value) is None
+            or value != value.strip(" \t")
+            for value in extra_headers.values()
+        ):
+            # Reject rather than trim: validation must not rewrite client values.
+            # Do not include values in errors, since custom headers may be secret.
+            raise ValueError(
+                "extra_headers values must be valid ASCII HTTP header values"
+            )
         protected = sorted(
             key for key in extra_headers
             if key.lower() in _RESPONSES_PROTECTED_HEADERS

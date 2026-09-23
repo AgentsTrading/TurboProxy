@@ -945,6 +945,45 @@ def test_responses_wrapper_rejects_protected_extra_headers(monkeypatch, header):
     aresponses.assert_not_awaited()
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("headers", [
+    {"X Trace": "trace-123"},
+    {"X-Trace": "trace-123\r\nX-Injected: value"},
+])
+def test_responses_wrapper_rejects_malformed_headers_before_dispatch(
+    monkeypatch, stream, headers,
+):
+    aresponses = AsyncMock()
+    monkeypatch.setattr(llm_module.litellm, "aresponses", aresponses)
+    call = llm_module.llm_stream_response if stream else llm_module.llm_response
+
+    with pytest.raises(ValueError, match="extra_headers"):
+        asyncio.run(call(
+            model="openai/gpt-4o", input="hello", extra_headers=headers,
+        ))
+
+    aresponses.assert_not_called()
+
+
+def test_responses_wrapper_preserves_valid_header_syntax(monkeypatch):
+    response = Mock()
+    response.model_dump.return_value = _response_with_tool_call()
+    aresponses = AsyncMock(return_value=response)
+    monkeypatch.setattr(llm_module.litellm, "aresponses", aresponses)
+    headers = {
+        "X-Trace": "trace-123",
+        "X-Empty": "",
+        "X-Whitespace": "one two\tthree",
+        "X-!#$%&'*+-.^_`|~0123456789": "!~",
+    }
+
+    asyncio.run(llm_module.llm_response(
+        model="openai/gpt-4o", input="hello", extra_headers=headers,
+    ))
+
+    assert aresponses.await_args.kwargs["extra_headers"] == headers
+
+
 @pytest.mark.parametrize("field", [
     "model", "input", "stream", "api_key", "api_base", "custom_llm_provider",
     "background", "context_management", "conversation", "previous_response_id",
@@ -3398,6 +3437,54 @@ def test_responses_route_rejects_invalid_requests_before_backend(
     assert response.json()["error"]["type"] == "invalid_request_error"
     assert response.json()["error"]["message"] == message
     complete_call.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(("header", "value", "message"), [
+    (header, "trace-123", "extra_headers keys must be valid HTTP header names")
+    for header in (
+        "X Trace", " X-Trace", "X-Trace ", "X-Trace:", "X-Trace\t",
+        "X-Trace\r\nX-Injected", "X-Tracé", "X-Trace\x00",
+    )
+] + [
+    ("X-Trace", value, "extra_headers values must be valid ASCII HTTP header values")
+    for value in (
+        "trace\r\nX-Injected: value", "trace\nvalue", "trace\rvalue",
+        "trace\x00value", "trace\x1fvalue", "trace\x7fvalue", "tracé",
+        " trace", "trace ", "\ttrace", "trace\t",
+    )
+])
+def test_responses_route_rejects_malformed_headers_before_dispatch(
+    tmp_path, monkeypatch, stream, header, value, message,
+):
+    server = ProxyServer(_config(tmp_path))
+    complete_call = AsyncMock(return_value=(_response_with_tool_call(), None))
+    stream_call = Mock(side_effect=AssertionError("stream must not start"))
+    monkeypatch.setattr(server.backend, "complete_responses", complete_call)
+    monkeypatch.setattr(server.backend, "stream_responses", stream_call)
+
+    async def request_invalid():
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver",
+        ) as client:
+            return await client.post("/v1/responses", json={
+                "input": "hello", "stream": stream,
+                "extra_headers": {header: value},
+            })
+
+    response = asyncio.run(request_invalid())
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"] == {
+        "message": message,
+        "type": "invalid_request_error",
+        "param": None,
+        "code": None,
+    }
+    complete_call.assert_not_called()
+    stream_call.assert_not_called()
 
 
 @pytest.mark.parametrize("stream", [False, True])
